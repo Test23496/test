@@ -1,0 +1,312 @@
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use sha2::{Sha256, Digest};
+use tokio::time::sleep;
+
+/// UnionTransformers 是一个转换器列表，按顺序尝试转换
+pub struct UnionTransformers {
+    transformers: Vec<Arc<dyn Transformer>>,
+}
+
+impl UnionTransformers {
+    pub fn new(transformers: Vec<Arc<dyn Transformer>>) -> Self {
+        Self { transformers }
+    }
+}
+
+#[async_trait::async_trait]
+impl Transformer for UnionTransformers {
+    async fn transform_from_storage(
+        &self,
+        ctx: Context,
+        data: &[u8],
+        data_ctx: &DataContext,
+    ) -> Result<TransformResult, Box<dyn std::error::Error + Send + Sync>> {
+        let mut errors = Vec::new();
+        
+        for (i, transformer) in self.transformers.iter().enumerate() {
+            match transformer.transform_from_storage(ctx.clone(), data, data_ctx).await {
+                Ok(mut result) => {
+                    // 当 i != 0 时，我们使用新的转换器从存储转换了数据，
+                    // 即使数据内容没有改变，我们也想向 etcd 发出写入
+                    result.stale = result.stale || i != 0;
+                    return Ok(result);
+                }
+                Err(err) => {
+                    errors.push(err);
+                    continue;
+                }
+            }
+        }
+        
+        if !errors.is_empty() {
+            // 返回聚合错误
+            return Err(format!("unionTransformers errors: {:?}", errors).into());
+        }
+        
+        Err("unionTransformers: unable to transform from storage".into())
+    }
+
+    async fn transform_to_storage(
+        &self,
+        ctx: Context,
+        data: &[u8],
+        data_ctx: &DataContext,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        // 总是使用第一个转换器进行写入
+        self.transformers[0].transform_to_storage(ctx, data, data_ctx).await
+    }
+}
+
+/// 计算加密配置哈希
+/// 返回已加载为字节的加密配置文件的预期哈希。
+/// 我们使用哈希而不是原始文件内容来跟踪更改，
+/// 以避免在关联的转换器之外的内存中保存任何加密密钥。
+pub fn compute_encryption_config_hash(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// TransformTracker 跟踪转换器和相关的健康检查
+struct TransformTracker {
+    transformer_overrides: HashMap<GroupResource, Arc<dyn Transformer>>,
+    kms_plugin_healthz_check: Arc<dyn HealthChecker>,
+    close_transformers: Option<tokio::sync::oneshot::Sender<()>>,
+    kms_close_grace_period: Duration,
+}
+
+/// DynamicTransformers 持有可能通过单个外部参与者（可能是控制器）动态更新的转换器。
+/// 此结构必须避免锁（甚至读写锁），因为它内联到所有对存储的调用。
+pub struct DynamicTransformers {
+    transform_tracker: Arc<AtomicPtr<TransformTracker>>,
+}
+
+impl DynamicTransformers {
+    /// 创建新的 DynamicTransformers
+    pub fn new(
+        transformer_overrides: HashMap<GroupResource, Arc<dyn Transformer>>,
+        kms_plugin_healthz_check: Arc<dyn HealthChecker>,
+        close_transformers: tokio::sync::oneshot::Sender<()>,
+        kms_close_grace_period: Duration,
+    ) -> Self {
+        let tracker = Box::new(TransformTracker {
+            transformer_overrides,
+            kms_plugin_healthz_check,
+            close_transformers: Some(close_transformers),
+            kms_close_grace_period,
+        });
+
+        let transform_tracker = Arc::new(AtomicPtr::new(Box::into_raw(tracker)));
+
+        Self { transform_tracker }
+    }
+
+    /// 设置转换器覆盖
+    /// 此方法不是 goroutine 安全的，必须在此对象的整个生命周期中仅由同一个单一调用者调用。
+    pub fn set(
+        &self,
+        transformer_overrides: HashMap<GroupResource, Arc<dyn Transformer>>,
+        close_transformers: tokio::sync::oneshot::Sender<()>,
+        kms_plugin_healthz_check: Arc<dyn HealthChecker>,
+        kms_close_grace_period: Duration,
+    ) {
+        // 存储新值
+        let new_tracker = Box::new(TransformTracker {
+            transformer_overrides,
+            kms_plugin_healthz_check,
+            close_transformers: Some(close_transformers),
+            kms_close_grace_period,
+        });
+
+        // 更新新的转换器覆盖
+        let old_ptr = self.transform_tracker.swap(
+            Box::into_raw(new_tracker),
+            Ordering::AcqRel,
+        );
+
+        // 安全地获取旧的 tracker
+        let old_tracker = unsafe { Box::from_raw(old_ptr) };
+
+        // 等待 grpc 请求完成任何正在进行的请求后关闭旧的转换器。
+        // 当我们生成这个 goroutine 时，新的转换器已经设置好并将用于新请求。
+        // 如果服务器在睡眠期间开始关闭，转换器将正确地提前关闭，
+        // 因为它们的生命周期与 api-server drain notifier 绑定。
+        let grace_period = old_tracker.kms_close_grace_period;
+        tokio::spawn(async move {
+            sleep(grace_period).await;
+            if let Some(close_tx) = old_tracker.close_transformers {
+                let _ = close_tx.send(());
+            }
+        });
+    }
+
+    /// 加载当前的 transform tracker
+    fn load_tracker(&self) -> &TransformTracker {
+        let ptr = self.transform_tracker.load(Ordering::Acquire);
+        unsafe { &*ptr }
+    }
+}
+
+impl HealthChecker for DynamicTransformers {
+    fn name(&self) -> &str {
+        "kms-reload-health-check"
+    }
+
+    fn check(&self, req: &http::Request<Vec<u8>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tracker = self.load_tracker();
+        tracker.kms_plugin_healthz_check.check(req)
+    }
+}
+
+impl ResourceTransformers for DynamicTransformers {
+    fn transformer_for_resource(&self, resource: &GroupResource) -> Arc<dyn Transformer> {
+        Arc::new(ResourceTransformer {
+            resource: resource.clone(),
+            transform_tracker: self.transform_tracker.clone(),
+        })
+    }
+}
+
+impl Drop for DynamicTransformers {
+    fn drop(&mut self) {
+        let ptr = self.transform_tracker.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            unsafe {
+                let _ = Box::from_raw(ptr);
+            }
+        }
+    }
+}
+
+/// ResourceTransformer 为特定资源提供转换器
+struct ResourceTransformer {
+    resource: GroupResource,
+    transform_tracker: Arc<AtomicPtr<TransformTracker>>,
+}
+
+impl ResourceTransformer {
+    /// 获取当前的转换器
+    fn transformer(&self) -> Arc<dyn Transformer> {
+        let ptr = self.transform_tracker.load(Ordering::Acquire);
+        let tracker = unsafe { &*ptr };
+        transformer_from_overrides(&tracker.transformer_overrides, &self.resource)
+    }
+}
+
+#[async_trait::async_trait]
+impl Transformer for ResourceTransformer {
+    async fn transform_from_storage(
+        &self,
+        ctx: Context,
+        data: &[u8],
+        data_ctx: &DataContext,
+    ) -> Result<TransformResult, Box<dyn std::error::Error + Send + Sync>> {
+        self.transformer().transform_from_storage(ctx, data, data_ctx).await
+    }
+
+    async fn transform_to_storage(
+        &self,
+        ctx: Context,
+        data: &[u8],
+        data_ctx: &DataContext,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        self.transformer().transform_to_storage(ctx, data, data_ctx).await
+    }
+}
+
+/// StaticTransformers 提供静态的资源到转换器的映射
+pub struct StaticTransformers {
+    transformers: HashMap<GroupResource, Arc<dyn Transformer>>,
+}
+
+impl StaticTransformers {
+    pub fn new(transformers: HashMap<GroupResource, Arc<dyn Transformer>>) -> Self {
+        Self { transformers }
+    }
+}
+
+impl ResourceTransformers for StaticTransformers {
+    fn transformer_for_resource(&self, resource: &GroupResource) -> Arc<dyn Transformer> {
+        transformer_from_overrides(&self.transformers, resource)
+    }
+}
+
+/// ResourceTransformers trait 定义了获取资源转换器的接口
+pub trait ResourceTransformers: Send + Sync {
+    fn transformer_for_resource(&self, resource: &GroupResource) -> Arc<dyn Transformer>;
+}
+
+/// 从覆盖映射中获取转换器
+fn transformer_from_overrides(
+    overrides: &HashMap<GroupResource, Arc<dyn Transformer>>,
+    resource: &GroupResource,
+) -> Arc<dyn Transformer> {
+    // 首先尝试精确匹配
+    if let Some(transformer) = overrides.get(resource) {
+        return transformer.clone();
+    }
+
+    // 尝试通配符匹配 "*.<group>"
+    let wildcard_group = GroupResource::new("*", &resource.resource);
+    if let Some(transformer) = overrides.get(&wildcard_group) {
+        return transformer.clone();
+    }
+
+    // 尝试完全通配符 "*.*"
+    let wildcard_all = GroupResource::new("*", "*");
+    if let Some(transformer) = overrides.get(&wildcard_all) {
+        return transformer.clone();
+    }
+
+    // 如果没有找到，返回身份转换器（不进行转换）
+    Arc::new(IdentityTransformer)
+}
+
+// 需要添加到 Cargo.toml:
+// [dependencies]
+// tokio = { version = "1", features = ["full", "time"] }
+// sha2 = "0.10"
+// async-trait = "0.1"
+// http = "0.2"
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_union_transformers() {
+        // 测试 UnionTransformers 的基本功能
+        let transformers = vec![
+            Arc::new(IdentityTransformer) as Arc<dyn Transformer>,
+        ];
+        let union = UnionTransformers::new(transformers);
+        
+        let ctx = Context::background();
+        let data_ctx = DataContext::new();
+        let data = b"test data";
+        
+        let result = union.transform_to_storage(ctx, data, &data_ctx).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_compute_encryption_config_hash() {
+        let data = b"test config data";
+        let hash = compute_encryption_config_hash(data);
+        assert!(hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn test_transformer_from_overrides() {
+        let mut overrides = HashMap::new();
+        let gr = GroupResource::new("apps", "deployments");
+        let transformer = Arc::new(IdentityTransformer) as Arc<dyn Transformer>;
+        overrides.insert(gr.clone(), transformer.clone());
+        
+        let result = transformer_from_overrides(&overrides, &gr);
+        assert!(Arc::ptr_eq(&result, &transformer));
+    }
+}
