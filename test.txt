@@ -1,312 +1,1361 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use sha2::{Sha256, Digest};
-use tokio::time::sleep;
+use std::sync::LazyLock;
 
-/// UnionTransformers 是一个转换器列表，按顺序尝试转换
-pub struct UnionTransformers {
-    transformers: Vec<Arc<dyn Transformer>>,
+static TRANSFORMER: IdentityTransformer = IdentityTransformer;
+static ENCRYPTED_PREFIX: &[u8] = b"k8s:enc:";
+static ERR_ENCRYPTED_DATA: LazyLock<Box<dyn std::error::Error + Send + Sync>> = 
+    LazyLock::new(|| "identity transformer tried to read encrypted data".into());
+
+/// identityTransformer 对提供的数据不执行任何转换，
+/// 但在 TransformFromStorage 期间验证数据不是加密数据
+#[derive(Debug, Clone, Copy)]
+pub struct IdentityTransformer;
+
+/// 返回一个 identityTransformer，在尝试读取加密数据时返回错误
+pub fn new_encrypt_check_transformer() -> IdentityTransformer {
+    TRANSFORMER
 }
 
-impl UnionTransformers {
-    pub fn new(transformers: Vec<Arc<dyn Transformer>>) -> Self {
-        Self { transformers }
+#[async_trait::async_trait]
+impl Transformer for IdentityTransformer {
+    /// 如果数据未加密，则返回输入字节
+    async fn transform_from_storage(
+        &self,
+        _ctx: Context,
+        data: &[u8],
+        _data_ctx: &DataContext,
+    ) -> Result<TransformResult, Box<dyn std::error::Error + Send + Sync>> {
+        // identityTransformer 必须在数据使用另一个转换器编码时返回错误。
+        // JSON 数据以 '{' 开头。Protobuf 数据有前缀 'k8s[\x00-\xFF]'。
+        // 前缀 'k8s:enc:' 保留用于磁盘上的加密数据。
+        if data.starts_with(ENCRYPTED_PREFIX) {
+            return Err(ERR_ENCRYPTED_DATA.to_string().into());
+        }
+        Ok(TransformResult::new(data.to_vec(), false))
+    }
+
+    /// 为 identityTransformer 实现 Transformer 接口
+    async fn transform_to_storage(
+        &self,
+        _ctx: Context,
+        data: &[u8],
+        _data_ctx: &DataContext,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(data.to_vec())
     }
 }
 
 #[async_trait::async_trait]
-impl Transformer for UnionTransformers {
+impl Read for IdentityTransformer {
     async fn transform_from_storage(
         &self,
         ctx: Context,
         data: &[u8],
         data_ctx: &DataContext,
     ) -> Result<TransformResult, Box<dyn std::error::Error + Send + Sync>> {
-        let mut errors = Vec::new();
-        
-        for (i, transformer) in self.transformers.iter().enumerate() {
-            match transformer.transform_from_storage(ctx.clone(), data, data_ctx).await {
-                Ok(mut result) => {
-                    // 当 i != 0 时，我们使用新的转换器从存储转换了数据，
-                    // 即使数据内容没有改变，我们也想向 etcd 发出写入
-                    result.stale = result.stale || i != 0;
-                    return Ok(result);
-                }
-                Err(err) => {
-                    errors.push(err);
-                    continue;
-                }
-            }
-        }
-        
-        if !errors.is_empty() {
-            // 返回聚合错误
-            return Err(format!("unionTransformers errors: {:?}", errors).into());
-        }
-        
-        Err("unionTransformers: unable to transform from storage".into())
-    }
-
-    async fn transform_to_storage(
-        &self,
-        ctx: Context,
-        data: &[u8],
-        data_ctx: &DataContext,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        // 总是使用第一个转换器进行写入
-        self.transformers[0].transform_to_storage(ctx, data, data_ctx).await
-    }
-}
-
-/// 计算加密配置哈希
-/// 返回已加载为字节的加密配置文件的预期哈希。
-/// 我们使用哈希而不是原始文件内容来跟踪更改，
-/// 以避免在关联的转换器之外的内存中保存任何加密密钥。
-pub fn compute_encryption_config_hash(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    format!("sha256:{:x}", hasher.finalize())
-}
-
-/// TransformTracker 跟踪转换器和相关的健康检查
-struct TransformTracker {
-    transformer_overrides: HashMap<GroupResource, Arc<dyn Transformer>>,
-    kms_plugin_healthz_check: Arc<dyn HealthChecker>,
-    close_transformers: Option<tokio::sync::oneshot::Sender<()>>,
-    kms_close_grace_period: Duration,
-}
-
-/// DynamicTransformers 持有可能通过单个外部参与者（可能是控制器）动态更新的转换器。
-/// 此结构必须避免锁（甚至读写锁），因为它内联到所有对存储的调用。
-pub struct DynamicTransformers {
-    transform_tracker: Arc<AtomicPtr<TransformTracker>>,
-}
-
-impl DynamicTransformers {
-    /// 创建新的 DynamicTransformers
-    pub fn new(
-        transformer_overrides: HashMap<GroupResource, Arc<dyn Transformer>>,
-        kms_plugin_healthz_check: Arc<dyn HealthChecker>,
-        close_transformers: tokio::sync::oneshot::Sender<()>,
-        kms_close_grace_period: Duration,
-    ) -> Self {
-        let tracker = Box::new(TransformTracker {
-            transformer_overrides,
-            kms_plugin_healthz_check,
-            close_transformers: Some(close_transformers),
-            kms_close_grace_period,
-        });
-
-        let transform_tracker = Arc::new(AtomicPtr::new(Box::into_raw(tracker)));
-
-        Self { transform_tracker }
-    }
-
-    /// 设置转换器覆盖
-    /// 此方法不是 goroutine 安全的，必须在此对象的整个生命周期中仅由同一个单一调用者调用。
-    pub fn set(
-        &self,
-        transformer_overrides: HashMap<GroupResource, Arc<dyn Transformer>>,
-        close_transformers: tokio::sync::oneshot::Sender<()>,
-        kms_plugin_healthz_check: Arc<dyn HealthChecker>,
-        kms_close_grace_period: Duration,
-    ) {
-        // 存储新值
-        let new_tracker = Box::new(TransformTracker {
-            transformer_overrides,
-            kms_plugin_healthz_check,
-            close_transformers: Some(close_transformers),
-            kms_close_grace_period,
-        });
-
-        // 更新新的转换器覆盖
-        let old_ptr = self.transform_tracker.swap(
-            Box::into_raw(new_tracker),
-            Ordering::AcqRel,
-        );
-
-        // 安全地获取旧的 tracker
-        let old_tracker = unsafe { Box::from_raw(old_ptr) };
-
-        // 等待 grpc 请求完成任何正在进行的请求后关闭旧的转换器。
-        // 当我们生成这个 goroutine 时，新的转换器已经设置好并将用于新请求。
-        // 如果服务器在睡眠期间开始关闭，转换器将正确地提前关闭，
-        // 因为它们的生命周期与 api-server drain notifier 绑定。
-        let grace_period = old_tracker.kms_close_grace_period;
-        tokio::spawn(async move {
-            sleep(grace_period).await;
-            if let Some(close_tx) = old_tracker.close_transformers {
-                let _ = close_tx.send(());
-            }
-        });
-    }
-
-    /// 加载当前的 transform tracker
-    fn load_tracker(&self) -> &TransformTracker {
-        let ptr = self.transform_tracker.load(Ordering::Acquire);
-        unsafe { &*ptr }
-    }
-}
-
-impl HealthChecker for DynamicTransformers {
-    fn name(&self) -> &str {
-        "kms-reload-health-check"
-    }
-
-    fn check(&self, req: &http::Request<Vec<u8>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let tracker = self.load_tracker();
-        tracker.kms_plugin_healthz_check.check(req)
-    }
-}
-
-impl ResourceTransformers for DynamicTransformers {
-    fn transformer_for_resource(&self, resource: &GroupResource) -> Arc<dyn Transformer> {
-        Arc::new(ResourceTransformer {
-            resource: resource.clone(),
-            transform_tracker: self.transform_tracker.clone(),
-        })
-    }
-}
-
-impl Drop for DynamicTransformers {
-    fn drop(&mut self) {
-        let ptr = self.transform_tracker.load(Ordering::Acquire);
-        if !ptr.is_null() {
-            unsafe {
-                let _ = Box::from_raw(ptr);
-            }
-        }
-    }
-}
-
-/// ResourceTransformer 为特定资源提供转换器
-struct ResourceTransformer {
-    resource: GroupResource,
-    transform_tracker: Arc<AtomicPtr<TransformTracker>>,
-}
-
-impl ResourceTransformer {
-    /// 获取当前的转换器
-    fn transformer(&self) -> Arc<dyn Transformer> {
-        let ptr = self.transform_tracker.load(Ordering::Acquire);
-        let tracker = unsafe { &*ptr };
-        transformer_from_overrides(&tracker.transformer_overrides, &self.resource)
+        <Self as Transformer>::transform_from_storage(self, ctx, data, data_ctx).await
     }
 }
 
 #[async_trait::async_trait]
-impl Transformer for ResourceTransformer {
-    async fn transform_from_storage(
-        &self,
-        ctx: Context,
-        data: &[u8],
-        data_ctx: &DataContext,
-    ) -> Result<TransformResult, Box<dyn std::error::Error + Send + Sync>> {
-        self.transformer().transform_from_storage(ctx, data, data_ctx).await
-    }
-
+impl Write for IdentityTransformer {
     async fn transform_to_storage(
         &self,
         ctx: Context,
         data: &[u8],
         data_ctx: &DataContext,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        self.transformer().transform_to_storage(ctx, data, data_ctx).await
+        <Self as Transformer>::transform_to_storage(self, ctx, data, data_ctx).await
     }
 }
-
-/// StaticTransformers 提供静态的资源到转换器的映射
-pub struct StaticTransformers {
-    transformers: HashMap<GroupResource, Arc<dyn Transformer>>,
-}
-
-impl StaticTransformers {
-    pub fn new(transformers: HashMap<GroupResource, Arc<dyn Transformer>>) -> Self {
-        Self { transformers }
-    }
-}
-
-impl ResourceTransformers for StaticTransformers {
-    fn transformer_for_resource(&self, resource: &GroupResource) -> Arc<dyn Transformer> {
-        transformer_from_overrides(&self.transformers, resource)
-    }
-}
-
-/// ResourceTransformers trait 定义了获取资源转换器的接口
-pub trait ResourceTransformers: Send + Sync {
-    fn transformer_for_resource(&self, resource: &GroupResource) -> Arc<dyn Transformer>;
-}
-
-/// 从覆盖映射中获取转换器
-fn transformer_from_overrides(
-    overrides: &HashMap<GroupResource, Arc<dyn Transformer>>,
-    resource: &GroupResource,
-) -> Arc<dyn Transformer> {
-    // 首先尝试精确匹配
-    if let Some(transformer) = overrides.get(resource) {
-        return transformer.clone();
-    }
-
-    // 尝试通配符匹配 "*.<group>"
-    let wildcard_group = GroupResource::new("*", &resource.resource);
-    if let Some(transformer) = overrides.get(&wildcard_group) {
-        return transformer.clone();
-    }
-
-    // 尝试完全通配符 "*.*"
-    let wildcard_all = GroupResource::new("*", "*");
-    if let Some(transformer) = overrides.get(&wildcard_all) {
-        return transformer.clone();
-    }
-
-    // 如果没有找到，返回身份转换器（不进行转换）
-    Arc::new(IdentityTransformer)
-}
-
-// 需要添加到 Cargo.toml:
-// [dependencies]
-// tokio = { version = "1", features = ["full", "time"] }
-// sha2 = "0.10"
-// async-trait = "0.1"
-// http = "0.2"
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_union_transformers() {
-        // 测试 UnionTransformers 的基本功能
-        let transformers = vec![
-            Arc::new(IdentityTransformer) as Arc<dyn Transformer>,
-        ];
-        let union = UnionTransformers::new(transformers);
-        
+    async fn test_identity_transformer_unencrypted_data() {
+        let transformer = IdentityTransformer;
+        let ctx = Context::background();
+        let data_ctx = DataContext::new();
+        let data = b"plain text data";
+
+        let result = transformer.transform_from_storage(ctx, data, &data_ctx).await;
+        assert!(result.is_ok());
+        let transform_result = result.unwrap();
+        assert_eq!(transform_result.data, data);
+        assert!(!transform_result.stale);
+    }
+
+    #[tokio::test]
+    async fn test_identity_transformer_encrypted_data() {
+        let transformer = IdentityTransformer;
+        let ctx = Context::background();
+        let data_ctx = DataContext::new();
+        let data = b"k8s:enc:encrypted data";
+
+        let result = transformer.transform_from_storage(ctx, data, &data_ctx).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("identity transformer tried to read encrypted data"));
+    }
+
+    #[tokio::test]
+    async fn test_identity_transformer_to_storage() {
+        let transformer = IdentityTransformer;
         let ctx = Context::background();
         let data_ctx = DataContext::new();
         let data = b"test data";
-        
-        let result = union.transform_to_storage(ctx, data, &data_ctx).await;
+
+        let result = transformer.transform_to_storage(ctx, data, &data_ctx).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn test_new_encrypt_check_transformer() {
+        let transformer = new_encrypt_check_transformer();
+        let ctx = Context::background();
+        let data_ctx = DataContext::new();
+        let data = b"test";
+
+        let result = transformer.transform_from_storage(ctx, data, &data_ctx).await;
         assert!(result.is_ok());
     }
+}
 
-    #[test]
-    fn test_compute_encryption_config_hash() {
-        let data = b"test config data";
-        let hash = compute_encryption_config_hash(data);
-        assert!(hash.starts_with("sha256:"));
+
+============================
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::time::{Duration, SystemTime};
+use tokio::sync::RwLock;
+
+pub const AES_CBC_TRANSFORMER_PREFIX_V1: &str = "k8s:enc:aescbc:v1:";
+pub const AES_GCM_TRANSFORMER_PREFIX_V1: &str = "k8s:enc:aesgcm:v1:";
+pub const SECRETBOX_TRANSFORMER_PREFIX_V1: &str = "k8s:enc:secretbox:v1:";
+pub const KMS_TRANSFORMER_PREFIX_V1: &str = "k8s:enc:kms:v1:";
+pub const KMS_TRANSFORMER_PREFIX_V2: &str = "k8s:enc:kms:v2:";
+
+// these constants relate to how the KMS v2 plugin status poll logic
+// and the DEK/seed generation logic behave.  In particular, the positive
+// interval and max TTL are closely related as the difference between
+// these values defines the worst case window in which the write DEK/seed
+// could expire due to the plugin going into an error state.  The
+// worst case window divided by the negative interval defines the
+// minimum amount of times the server will attempt to return to a
+// healthy state before the DEK/seed expires and writes begin to fail.
+//
+// For now, these values are kept small and hardcoded to support being
+// able to perform a "passive" storage migration while tolerating some
+// amount of plugin downtime.
+//
+// With the current approach, a user can update the key ID their plugin
+// is using and then can simply schedule a migration for 3 + N + M minutes
+// later where N is how long it takes their plugin to pick up new config
+// and M is extra buffer to allow the API server to process the config.
+// At that point, they are guaranteed to either migrate to the new key
+// or get errors during the migration.
+//
+// If the API server coasted forever on the last DEK/seed, they would need
+// to actively check if it had observed the new key ID before starting
+// a migration - otherwise it could keep using the old DEK/seed and their
+// storage migration would not do what they thought it did.
+pub const KMSV2_PLUGIN_HEALTHZ_POSITIVE_INTERVAL: Duration = Duration::from_secs(60); // 1 minute
+pub const KMSV2_PLUGIN_HEALTHZ_NEGATIVE_INTERVAL: Duration = Duration::from_secs(10); // 10 seconds
+pub const KMSV2_PLUGIN_WRITE_DEK_SOURCE_MAX_TTL: Duration = Duration::from_secs(180); // 3 minutes
+
+pub const KMS_PLUGIN_HEALTHZ_NEGATIVE_TTL: Duration = Duration::from_secs(3);
+pub const KMS_PLUGIN_HEALTHZ_POSITIVE_TTL: Duration = Duration::from_secs(20);
+pub const KMS_API_VERSION_V1: &str = "v1";
+pub const KMS_API_VERSION_V2: &str = "v2";
+
+// this name is used for two different healthz endpoints:
+// - when one or more KMS v2 plugins are in use and no KMS v1 plugins are in use
+//   in this case, all v2 plugins are probed via this single endpoint
+// - when automatic reload of encryption config is enabled
+//   in this case, all KMS plugins are probed via this single endpoint
+//   the endpoint is present even if there are no KMS plugins configured (it is a no-op then)
+pub const KMS_RELOAD_HEALTH_CHECK_NAME: &str = "kms-providers";
+
+// this map allows us to swap enablement of the KMSv2KDF feature in tests
+// as the feature gate is now locked to true starting with v1.29
+// Note: it cannot be set by an end user
+// KDF enablement is tracked per KMS provider to allow tests to run in parallel.
+static KDF_ENABLED_PER_KMS: LazyLock<RwLock<HashMap<String, bool>>> = 
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+// this function should be used to determine enablement of the KMSv2KDF feature
+// instead of getting it from DefaultFeatureGate as the feature gate is now locked
+// to true starting with v1.29
+// to allow integration tests to run in parallel, this "feature flag" can be set
+// per KMS provider as long as all providers use distinct names.
+pub async fn get_kdf(kms_name: &str) -> bool {
+    let map = KDF_ENABLED_PER_KMS.read().await;
+    // explicit config is missing, but KDF is enabled by default
+    map.get(kms_name).copied().unwrap_or(true)
+}
+
+pub async fn set_kdf(kms_name: String, enabled: bool) {
+    let mut map = KDF_ENABLED_PER_KMS.write().await;
+    map.insert(kms_name, enabled);
+}
+
+#[derive(Clone)]
+struct KmsPluginHealthzResponse {
+    err: Option<String>,
+    received: SystemTime,
+}
+
+pub struct KmsPluginProbe {
+    name: String,
+    ttl: Duration,
+    service: Arc<dyn EnvelopeService>,
+    last_response: Arc<Mutex<KmsPluginHealthzResponse>>,
+}
+
+impl KmsPluginProbe {
+    pub fn new(name: String, service: Arc<dyn EnvelopeService>) -> Self {
+        Self {
+            name,
+            ttl: KMS_PLUGIN_HEALTHZ_POSITIVE_TTL,
+            service,
+            last_response: Arc::new(Mutex::new(KmsPluginHealthzResponse {
+                err: None,
+                received: SystemTime::now(),
+            })),
+        }
     }
 
-    #[test]
-    fn test_transformer_from_overrides() {
-        let mut overrides = HashMap::new();
-        let gr = GroupResource::new("apps", "deployments");
-        let transformer = Arc::new(IdentityTransformer) as Arc<dyn Transformer>;
-        overrides.insert(gr.clone(), transformer.clone());
+    pub fn to_healthz_check(&self, idx: usize) -> Box<dyn HealthChecker> {
+        let probe = self.clone();
+        Box::new(NamedHealthChecker {
+            name: format!("kms-provider-{}", idx),
+            check_fn: Arc::new(move |_req| probe.check()),
+        })
+    }
+
+    /// check encrypts and decrypts test data against KMS-Plugin's gRPC endpoint.
+    fn check(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut last_response = self.last_response.lock().unwrap();
+
+        if SystemTime::now().duration_since(last_response.received).unwrap_or(Duration::MAX) < self.ttl {
+            return match &last_response.err {
+                None => Ok(()),
+                Some(err) => Err(err.clone().into()),
+            };
+        }
+
+        match self.service.encrypt(b"ping") {
+            Ok(encrypted) => {
+                match self.service.decrypt(&encrypted) {
+                    Ok(_) => {
+                        *last_response = KmsPluginHealthzResponse {
+                            err: None,
+                            received: SystemTime::now(),
+                        };
+                        drop(last_response);
+                        Ok(())
+                    }
+                    Err(err) => {
+                        let error_msg = format!(
+                            "failed to perform decrypt section of the healthz check for KMS Provider {}, error: {}",
+                            self.name, err
+                        );
+                        *last_response = KmsPluginHealthzResponse {
+                            err: Some(error_msg.clone()),
+                            received: SystemTime::now(),
+                        };
+                        drop(last_response);
+                        Err(error_msg.into())
+                    }
+                }
+            }
+            Err(err) => {
+                let error_msg = format!(
+                    "failed to perform encrypt section of the healthz check for KMS Provider {}, error: {}",
+                    self.name, err
+                );
+                *last_response = KmsPluginHealthzResponse {
+                    err: Some(error_msg.clone()),
+                    received: SystemTime::now(),
+                };
+                drop(last_response);
+                Err(error_msg.into())
+            }
+        }
+    }
+}
+
+impl Clone for KmsPluginProbe {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            ttl: self.ttl,
+            service: self.service.clone(),
+            last_response: self.last_response.clone(),
+        }
+    }
+}
+
+pub struct Kmsv2PluginProbe {
+    state: Arc<AtomicPtr<State>>,
+    name: String,
+    ttl: Arc<Mutex<Duration>>,
+    service: Arc<dyn KmsService>,
+    last_response: Arc<Mutex<KmsPluginHealthzResponse>>,
+    api_server_id: String,
+    version: Arc<Mutex<String>>,
+}
+
+impl Kmsv2PluginProbe {
+    pub fn new(name: String, service: Arc<dyn KmsService>, api_server_id: String) -> Self {
+        let initial_state = Box::new(State::default());
+        Self {
+            state: Arc::new(AtomicPtr::new(Box::into_raw(initial_state))),
+            name,
+            ttl: Arc::new(Mutex::new(KMSV2_PLUGIN_HEALTHZ_POSITIVE_INTERVAL)),
+            service,
+            last_response: Arc::new(Mutex::new(KmsPluginHealthzResponse {
+                err: None,
+                received: SystemTime::now(),
+            })),
+            api_server_id,
+            version: Arc::new(Mutex::new(String::new())),
+        }
+    }
+
+    pub fn to_healthz_check(&self, idx: usize) -> Box<dyn HealthChecker> {
+        let probe = self.clone();
+        Box::new(NamedHealthChecker {
+            name: format!("kms-provider-{}", idx),
+            check_fn: Arc::new(move |_req| {
+                let probe = probe.clone();
+                Box::pin(async move { probe.check().await })
+            }),
+        })
+    }
+
+    /// check gets the healthz status of the KMSv2-Plugin using the Status() method.
+    async fn check(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut last_response = self.last_response.lock().unwrap();
+        let ttl = *self.ttl.lock().unwrap();
+
+        if SystemTime::now().duration_since(last_response.received).unwrap_or(Duration::MAX) < ttl {
+            return match &last_response.err {
+                None => Ok(()),
+                Some(err) => Err(err.clone().into()),
+            };
+        }
+        drop(last_response);
+
+        match self.service.status().await {
+            Ok(status_response) => {
+                match self.is_kmsv2_provider_healthy_and_maybe_rotate_dek(&status_response).await {
+                    Ok(_) => {
+                        let mut last_response = self.last_response.lock().unwrap();
+                        *last_response = KmsPluginHealthzResponse {
+                            err: None,
+                            received: SystemTime::now(),
+                        };
+                        *self.ttl.lock().unwrap() = KMSV2_PLUGIN_HEALTHZ_POSITIVE_INTERVAL;
+                        Ok(())
+                    }
+                    Err(err) => {
+                        let mut last_response = self.last_response.lock().unwrap();
+                        *last_response = KmsPluginHealthzResponse {
+                            err: Some(err.to_string()),
+                            received: SystemTime::now(),
+                        };
+                        *self.ttl.lock().unwrap() = KMSV2_PLUGIN_HEALTHZ_NEGATIVE_INTERVAL;
+                        Err(err)
+                    }
+                }
+            }
+            Err(err) => {
+                let mut last_response = self.last_response.lock().unwrap();
+                let error_msg = format!(
+                    "failed to perform status section of the healthz check for KMS Provider {}, error: {}",
+                    self.name, err
+                );
+                *last_response = KmsPluginHealthzResponse {
+                    err: Some(error_msg.clone()),
+                    received: SystemTime::now(),
+                };
+                *self.ttl.lock().unwrap() = KMSV2_PLUGIN_HEALTHZ_NEGATIVE_INTERVAL;
+                Err(error_msg.into())
+            }
+        }
+    }
+
+    /// rotateDEKOnKeyIDChange tries to rotate to a new DEK/seed if the key ID returned by Status does not match the
+    /// current state.  If a successful rotation is performed, the new DEK/seed and keyID overwrite the existing state.
+    /// On any failure during rotation (including mismatch between status and encrypt calls), the current state is
+    /// preserved and will remain valid to use for encryption until its expiration (the system attempts to coast).
+    /// If the key ID returned by Status matches the current state, the expiration of the current state is extended
+    /// and no rotation is performed.
+    async fn rotate_dek_on_key_id_change(&self, status_key_id: &str, uid: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // we do not check ValidateEncryptCapability here because it is fine to re-use an old key
+        // that was marked as expired during an unhealthy period.  As long as the key ID matches
+        // what we expect then there is no need to rotate here.
+        let state = self.get_current_state();
+        let err_state = state.as_ref().err();
+
+        // allow reads indefinitely in all cases
+        // allow writes indefinitely as long as there is no error
+        // allow writes for only up to kmsv2PluginWriteDEKSourceMaxTTL from now when there are errors
+        // we start the timer before we make the network call because kmsv2PluginWriteDEKSourceMaxTTL is meant to be the upper bound
+        let expiration_timestamp = SystemTime::now() + KMSV2_PLUGIN_WRITE_DEK_SOURCE_MAX_TTL;
+
+        // dynamically check if we want to use KDF seed to derive DEKs or just a single DEK
+        // this gate can only change during tests, but the check is cheap enough to always make
+        // this allows us to easily exercise both modes without restarting the API server
+        // TODO integration test that this dynamically takes effect
+        let use_seed = get_kdf(&self.name).await;
+        let state_use_seed = state.as_ref().ok()
+            .map(|s| s.encrypted_object_encrypted_dek_source_type == EncryptedDEKSourceType::HkdfSha256XNonceAesGcmSeed)
+            .unwrap_or(false);
+
+        // state is valid and status keyID is unchanged from when we generated this DEK/seed so there is no need to rotate it
+        // just move the expiration of the current state forward by the reuse interval
+        // useSeed can only change at runtime during tests, so we check it here to allow us to easily exercise both modes
+        if let Ok(ref current_state) = state {
+            if current_state.encrypted_object_key_id == status_key_id && state_use_seed == use_seed {
+                let mut new_state = current_state.clone();
+                new_state.expiration_timestamp = expiration_timestamp;
+                let boxed_state = Box::new(new_state);
+                let old_ptr = self.state.swap(Box::into_raw(boxed_state), Ordering::AcqRel);
+                unsafe { drop(Box::from_raw(old_ptr)); }
+                return Ok(());
+            }
+        }
+
+        let (transformer, enc_object, cache_key) = generate_transformer(uid, self.service.clone(), use_seed).await?;
+
+        // happy path, should be the common case
+        // TODO maybe add success metrics?
+        if enc_object.key_id == status_key_id {
+            let new_state = Box::new(State {
+                transformer,
+                encrypted_object_key_id: enc_object.key_id.clone(),
+                encrypted_object_encrypted_dek_source: enc_object.encrypted_dek_source,
+                encrypted_object_annotations: enc_object.annotations,
+                encrypted_object_encrypted_dek_source_type: enc_object.encrypted_dek_source_type,
+                uid: uid.to_string(),
+                expiration_timestamp,
+                cache_key,
+            });
+
+            let old_ptr = self.state.swap(Box::into_raw(new_state), Ordering::AcqRel);
+            unsafe { drop(Box::from_raw(old_ptr)); }
+
+            // it should be logically impossible for the new state to be invalid but check just in case
+            if self.get_current_state().is_ok() {
+                // TODO: add logging similar to klog.V(6)
+                return Ok(());
+            }
+        }
+
+        Err(format!(
+            "failed to rotate DEK uid={:?}, useSeed={}, errState={:?}, statusKeyIDHash={:?}, encryptKeyIDHash={:?}",
+            uid, use_seed, err_state, get_hash_if_not_empty(status_key_id), get_hash_if_not_empty(&enc_object.key_id)
+        ).into())
+    }
+
+    /// getCurrentState returns the latest state from the last status and encrypt calls.
+    /// If the returned error is nil, the state is considered valid indefinitely for read requests.
+    /// For write requests, the caller must also check that state.ValidateEncryptCapability does not error.
+    fn get_current_state(&self) -> Result<State, Box<dyn std::error::Error + Send + Sync>> {
+        let ptr = self.state.load(Ordering::Acquire);
+        let state = unsafe { &*ptr };
+
+        if state.transformer.is_none() {
+            return Err("got unexpected nil transformer".into());
+        }
+
+        let encrypted_object_copy = EncryptedObject {
+            key_id: state.encrypted_object_key_id.clone(),
+            encrypted_dek_source: state.encrypted_object_encrypted_dek_source.clone(),
+            annotations: state.encrypted_object_annotations.clone(),
+            encrypted_dek_source_type: state.encrypted_object_encrypted_dek_source_type,
+            encrypted_data: vec![0], // any non-empty value to pass validation
+        };
+        if let Err(err) = validate_encrypted_object(&encrypted_object_copy) {
+            return Err(format!("got invalid EncryptedObject: {}", err).into());
+        }
+
+        if state.expiration_timestamp <= SystemTime::UNIX_EPOCH {
+            return Err("got unexpected zero expirationTimestamp".into());
+        }
+
+        if state.cache_key.is_empty() {
+            return Err("got unexpected empty cacheKey".into());
+        }
+
+        Ok(state.clone())
+    }
+
+    async fn is_kmsv2_provider_healthy_and_maybe_rotate_dek(&self, response: &StatusResponse) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut errors = Vec::new();
+
+        if response.healthz != "ok" {
+            errors.push(format!("got unexpected healthz status: {}", response.healthz));
+        }
+
+        if response.version != KMS_API_VERSION_V2 && response.version != "v2beta1" {
+            errors.push(format!("expected KMSv2 API version {}, got {}", KMS_API_VERSION_V2, response.version));
+        } else {
+            // set version for the first status response
+            let mut version = self.version.lock().unwrap();
+            if version.is_empty() {
+                *version = response.version.clone();
+            }
+            if *version != response.version {
+                errors.push(format!(
+                    "KMSv2 API version should not change after the initial status response version {}, got {}",
+                    version, response.version
+                ));
+            }
+        }
+
+        if let Err(err) = validate_key_id(&response.key_id) {
+            // TODO: record metrics
+            // envelopemetrics::record_invalid_key_id_from_status(&self.name, &err_code);
+            errors.push(format!("got invalid KMSv2 KeyID hash {:?}: {}", get_hash_if_not_empty(&response.key_id), err));
+        } else {
+            // TODO: record metrics
+            // envelopemetrics::record_key_id_from_status(&self.name, &response.key_id, &self.api_server_id);
+            let uid = uuid::Uuid::new_v4().to_string();
+            // unconditionally append as we filter out nil errors below
+            if let Err(err) = self.rotate_dek_on_key_id_change(&response.key_id, &uid).await {
+                errors.push(err.to_string());
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(format!("kmsv2 Provider {} is not healthy, error: {:?}", self.name, errors).into());
+        }
+
+        Ok(())
+    }
+}
+
+impl Clone for Kmsv2PluginProbe {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            name: self.name.clone(),
+            ttl: self.ttl.clone(),
+            service: self.service.clone(),
+            last_response: self.last_response.clone(),
+            api_server_id: self.api_server_id.clone(),
+            version: self.version.clone(),
+        }
+    }
+}
+
+pub struct KmsHealthChecker {
+    checkers: Vec<Box<dyn HealthChecker>>,
+}
+
+impl KmsHealthChecker {
+    pub fn new(checkers: Vec<Box<dyn HealthChecker>>) -> Self {
+        Self { checkers }
+    }
+}
+
+impl HealthChecker for KmsHealthChecker {
+    fn name(&self) -> &str {
+        KMS_RELOAD_HEALTH_CHECK_NAME
+    }
+
+    fn check(&self, req: &http::Request<Vec<u8>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut errors = Vec::new();
+
+        for checker in &self.checkers {
+            if let Err(err) = checker.check(req) {
+                errors.push(format!("{}: {}", checker.name(), err));
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(format!("health check errors: {:?}", errors).into());
+        }
+
+        Ok(())
+    }
+}
+
+pub trait HealthChecker: Send + Sync {
+    fn name(&self) -> &str;
+    fn check(&self, req: &http::Request<Vec<u8>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+struct NamedHealthChecker {
+    name: String,
+    check_fn: Arc<dyn Fn(&http::Request<Vec<u8>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> + Send + Sync>,
+}
+
+impl HealthChecker for NamedHealthChecker {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn check(&self, req: &http::Request<Vec<u8>>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        (self.check_fn)(req)
+    }
+}
+
+pub trait HealthCheckerInterface {
+    fn to_healthz_check(&self, idx: usize) -> Box<dyn HealthChecker>;
+}
+
+#[derive(Default)]
+pub struct KmsState {
+    pub v1_used: bool,
+    pub v2_used: bool,
+    pub kms_timeout_sum: Duration,
+}
+
+impl KmsState {
+    /// accumulate computes the KMS state by:
+    ///   - determining which KMS plugin versions are in use
+    ///   - calculating kmsTimeoutSum which is used as transformTracker.kmsCloseGracePeriod
+    ///     DynamicTransformers.Set waits for this period before closing old transformers after a config reload
+    pub fn accumulate(&mut self, other: &KmsState) {
+        self.v1_used = self.v1_used || other.v1_used;
+        self.v2_used = self.v2_used || other.v2_used;
+        self.kms_timeout_sum += other.kms_timeout_sum;
+    }
+}
+
+pub static ANY_GROUP_ANY_RESOURCE: LazyLock<GroupResource> = LazyLock::new(|| {
+    GroupResource {
+        group: "*".to_string(),
+        resource: "*".to_string(),
+    }
+});
+
+pub fn gr_yaml_string(gr: &GroupResource) -> String {
+    if gr.group.is_empty() && gr.resource == "*" {
+        return "*.".to_string();
+    }
+    format!("{}.{}", gr.resource, gr.group)
+}
+
+// The factory to create kms service. This is to make writing test easier.
+pub trait EnvelopeService: Send + Sync {
+    fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+    fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+// The factory to create kmsv2 service. Exported for integration tests.
+#[async_trait::async_trait]
+pub trait KmsService: Send + Sync {
+    async fn status(&self) -> Result<StatusResponse, Box<dyn std::error::Error + Send + Sync>>;
+    async fn encrypt(&self, uid: &str, data: &[u8]) -> Result<EncryptResponse, Box<dyn std::error::Error + Send + Sync>>;
+    async fn decrypt(&self, uid: &str, req: &DecryptRequest) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+pub struct StatusResponse {
+    pub healthz: String,
+    pub version: String,
+    pub key_id: String,
+}
+
+#[derive(Clone, Default)]
+pub struct State {
+    pub transformer: Option<Arc<dyn Transformer>>,
+    pub encrypted_object_key_id: String,
+    pub encrypted_object_encrypted_dek_source: Vec<u8>,
+    pub encrypted_object_annotations: HashMap<String, Vec<u8>>,
+    pub encrypted_object_encrypted_dek_source_type: EncryptedDEKSourceType,
+    pub uid: String,
+    pub expiration_timestamp: SystemTime,
+    pub cache_key: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EncryptedDEKSourceType {
+    #[default]
+    AesGcmKey,
+    HkdfSha256XNonceAesGcmSeed,
+}
+
+#[derive(Clone, Default)]
+pub struct EncryptedObject {
+    pub key_id: String,
+    pub encrypted_dek_source: Vec<u8>,
+    pub annotations: HashMap<String, Vec<u8>>,
+    pub encrypted_dek_source_type: EncryptedDEKSourceType,
+    pub encrypted_data: Vec<u8>,
+}
+
+pub struct GroupResource {
+    pub group: String,
+    pub resource: String,
+}
+
+async fn generate_transformer(
+    _uid: &str,
+    _service: Arc<dyn KmsService>,
+    _use_seed: bool,
+) -> Result<(Option<Arc<dyn Transformer>>, EncryptedObject, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    Ok((None, EncryptedObject::default(), Vec::new()))
+}
+
+fn validate_encrypted_object(_obj: &EncryptedObject) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Ok(())
+}
+
+fn validate_key_id(_key_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Ok(())
+}
+
+fn get_hash_if_not_empty(_data: &str) -> String {
+    String::new()
+}
+
+pub trait Transformer: Send + Sync {}
+
+pub struct DecryptRequest;
+pub struct EncryptResponse;
+
+use std::sync::LazyLock;
+
+========================
+
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use tokio::sync::RwLock;
+
+/// LoadEncryptionConfig parses and validates the encryption config specified by filepath.
+/// It may launch multiple go routines whose lifecycle is controlled by ctx.
+/// In case of an error, the caller is responsible for canceling ctx to clean up any go routines that may have been launched.
+/// If reload is true, or KMS v2 plugins are used with no KMS v1 plugins, the returned slice of health checkers will always be of length 1.
+pub async fn load_encryption_config(
+    ctx: Context,
+    filepath: &str,
+    reload: bool,
+    api_server_id: &str,
+) -> Result<EncryptionConfiguration, Box<dyn std::error::Error + Send + Sync>> {
+    let (config, content_hash) = load_config(filepath, reload).await?;
+
+    let (transformers, kms_health_checks, kms_used) = 
+        get_transformer_overrides_and_kms_plugin_healthz_checkers(ctx, &config, api_server_id).await
+        .map_err(|e| format!("error while building transformers: {}", e))?;
+
+    let kms_health_checks = if reload || (kms_used.v2_used && !kms_used.v1_used) {
+        vec![Box::new(KmsHealthChecker::new(kms_health_checks)) as Box<dyn HealthChecker>]
+    } else {
+        kms_health_checks
+    };
+
+    // KMSCloseGracePeriod is the duration we will wait before closing old transformers.
+    // The way we calculate is as follows:
+    // 1. Sum all timeouts across all KMS plugins. (check kmsPrefixTransformer for differences between v1 and v2)
+    // 2. Multiply that by 2 (to allow for some buffer)
+    // The reason we sum all timeout is because kmsHealthChecker() will run all health checks serially
+    Ok(EncryptionConfiguration {
+        transformers,
+        health_checks: kms_health_checks,
+        encryption_file_content_hash: content_hash,
+        kms_close_grace_period: kms_used.kms_timeout_sum * 2,
+    })
+}
+
+/// getTransformerOverridesAndKMSPluginHealthzCheckers creates the set of transformers and KMS healthz checks based on the given config.
+/// It may launch multiple go routines whose lifecycle is controlled by ctx.
+/// In case of an error, the caller is responsible for canceling ctx to clean up any go routines that may have been launched.
+async fn get_transformer_overrides_and_kms_plugin_healthz_checkers(
+    ctx: Context,
+    config: &EncryptionConfig,
+    api_server_id: &str,
+) -> Result<(HashMap<GroupResource, Arc<dyn Transformer>>, Vec<Box<dyn HealthChecker>>, KmsState), Box<dyn std::error::Error + Send + Sync>> {
+    let mut kms_health_checks = Vec::new();
+    let (transformers, probes, kms_used) = 
+        get_transformer_overrides_and_kms_plugin_probes(ctx, config, api_server_id).await?;
+    
+    for (i, probe) in probes.into_iter().enumerate() {
+        kms_health_checks.push(probe.to_healthz_check(i));
+    }
+
+    Ok((transformers, kms_health_checks, kms_used))
+}
+
+/// getTransformerOverridesAndKMSPluginProbes creates the set of transformers and KMS probes based on the given config.
+/// It may launch multiple go routines whose lifecycle is controlled by ctx.
+/// In case of an error, the caller is responsible for canceling ctx to clean up any go routines that may have been launched.
+async fn get_transformer_overrides_and_kms_plugin_probes(
+    ctx: Context,
+    config: &EncryptionConfig,
+    api_server_id: &str,
+) -> Result<(HashMap<GroupResource, Arc<dyn Transformer>>, Vec<Box<dyn HealthCheckerInterface>>, KmsState), Box<dyn std::error::Error + Send + Sync>> {
+    let mut resource_to_prefix_transformer: HashMap<GroupResource, Vec<PrefixTransformer>> = HashMap::new();
+    let mut probes = Vec::new();
+    let mut kms_used = KmsState::default();
+
+    // For each entry in the configuration
+    for resource_config in &config.resources {
+        let (transformers, p, used) = prefix_transformers_and_probes(ctx.clone(), resource_config, api_server_id).await?;
+        kms_used.accumulate(&used);
+
+        // For each resource, create a list of providers to use
+        for resource in &resource_config.resources {
+            let gr = parse_group_resource(resource);
+
+            // check if resource is masked by *.group rule
+            let any_resource_in_group = GroupResource {
+                group: gr.group.clone(),
+                resource: "*".to_string(),
+            };
+            if resource_to_prefix_transformer.contains_key(&any_resource_in_group) {
+                // an earlier rule already configured a transformer for *.group, masking this rule
+                // return error since this is not allowed
+                return Err(format!(
+                    "resource {:?} is masked by earlier rule {:?}",
+                    gr_yaml_string(&gr),
+                    gr_yaml_string(&any_resource_in_group)
+                ).into());
+            }
+
+            if resource_to_prefix_transformer.contains_key(&*ANY_GROUP_ANY_RESOURCE) {
+                // an earlier rule already configured a transformer for *.*, masking this rule
+                // return error since this is not allowed
+                return Err(format!(
+                    "resource {:?} is masked by earlier rule {:?}",
+                    gr_yaml_string(&gr),
+                    gr_yaml_string(&*ANY_GROUP_ANY_RESOURCE)
+                ).into());
+            }
+
+            resource_to_prefix_transformer
+                .entry(gr)
+                .or_insert_with(Vec::new)
+                .extend(transformers.clone());
+        }
+
+        probes.extend(p);
+    }
+
+    let mut transformers = HashMap::new();
+    for (gr, trans_list) in resource_to_prefix_transformer {
+        transformers.insert(
+            gr,
+            Arc::new(PrefixTransformers::new(trans_list)) as Arc<dyn Transformer>
+        );
+    }
+
+    Ok((transformers, probes, kms_used))
+}
+
+/// loadConfig parses the encryption configuration file at filepath and returns the parsed config and hash of the file.
+async fn load_config(
+    filepath: &str,
+    reload: bool,
+) -> Result<(EncryptionConfig, String), Box<dyn std::error::Error + Send + Sync>> {
+    let (data, content_hash) = load_data_and_hash(filepath)
+        .map_err(|e| format!("error while loading file: {}", e))?;
+
+    let config = decode_encryption_config(&data)
+        .map_err(|e| format!("error decoding encryption provider configuration file {:?}: {}", filepath, e))?;
+
+    validate_encryption_configuration(&config, reload)?;
+
+    Ok((config, content_hash))
+}
+
+fn load_data_and_hash(filepath: &str) -> Result<(Vec<u8>, String), Box<dyn std::error::Error + Send + Sync>> {
+    let data = fs::read(filepath)
+        .map_err(|e| format!("error reading encryption provider configuration file {:?}: {}", filepath, e))?;
+    
+    if data.is_empty() {
+        return Err(format!("encryption provider configuration file {:?} is empty", filepath).into());
+    }
+
+    Ok((data.clone(), compute_encryption_config_hash(&data)))
+}
+
+/// GetEncryptionConfigHash reads the encryption configuration file at filepath and returns the hash of the file.
+/// It does not attempt to decode or load the config, and serves as a cheap check to determine if the file has changed.
+pub fn get_encryption_config_hash(filepath: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let (_, content_hash) = load_data_and_hash(filepath)?;
+    Ok(content_hash)
+}
+
+/// prefixTransformersAndProbes creates the set of transformers and KMS probes based on the given resource config.
+/// It may launch multiple go routines whose lifecycle is controlled by ctx.
+/// In case of an error, the caller is responsible for canceling ctx to clean up any go routines that may have been launched.
+async fn prefix_transformers_and_probes(
+    ctx: Context,
+    config: &ResourceConfiguration,
+    api_server_id: &str,
+) -> Result<(Vec<PrefixTransformer>, Vec<Box<dyn HealthCheckerInterface>>, KmsState), Box<dyn std::error::Error + Send + Sync>> {
+    let mut transformers = Vec::new();
+    let mut probes: Vec<Box<dyn HealthCheckerInterface>> = Vec::new();
+    let mut kms_used = KmsState::default();
+
+    for provider in &config.providers {
+        let (transformer, probe, used) = match provider {
+            Provider::AESGCM(config) => {
+                let transformer = aes_prefix_transformer(
+                    config,
+                    |block| new_gcm_transformer(block),
+                    AES_GCM_TRANSFORMER_PREFIX_V1,
+                )?;
+                (transformer, None, None)
+            }
+
+            Provider::AESCBC(config) => {
+                let transformer = aes_prefix_transformer(
+                    config,
+                    |block| Ok(new_cbc_transformer(block)),
+                    AES_CBC_TRANSFORMER_PREFIX_V1,
+                )?;
+                (transformer, None, None)
+            }
+
+            Provider::Secretbox(config) => {
+                let transformer = secretbox_prefix_transformer(config)?;
+                (transformer, None, None)
+            }
+
+            Provider::KMS(config) => {
+                let (transformer, probe, used) = kms_prefix_transformer(ctx.clone(), config, api_server_id).await?;
+                (transformer, Some(probe), Some(used))
+            }
+
+            Provider::Identity => {
+                let transformer = PrefixTransformer {
+                    transformer: Arc::new(IdentityTransformer),
+                    prefix: Vec::new(),
+                };
+                (transformer, None, None)
+            }
+        };
+
+        if let Some(probe) = probe {
+            probes.push(probe);
+        }
+        if let Some(used) = used {
+            kms_used.accumulate(&used);
+        }
+
+        transformers.push(transformer);
+    }
+
+    Ok((transformers, probes, kms_used))
+}
+
+type BlockTransformerFunc = fn(Block) -> Result<Arc<dyn Transformer>, Box<dyn std::error::Error + Send + Sync>>;
+
+fn aes_prefix_transformer(
+    config: &AESConfiguration,
+    func: BlockTransformerFunc,
+    prefix: &str,
+) -> Result<PrefixTransformer, Box<dyn std::error::Error + Send + Sync>> {
+    if config.keys.is_empty() {
+        return Err("aes provider has no valid keys".into());
+    }
+
+    for key in &config.keys {
+        if key.name.is_empty() {
+            return Err("key with invalid name provided".into());
+        }
+        if key.secret.is_empty() {
+            return Err(format!("key {} has no provided secret", key.name).into());
+        }
+    }
+
+    let mut key_transformers = Vec::new();
+
+    for key_data in &config.keys {
+        let key = base64::decode(&key_data.secret)
+            .map_err(|e| format!("could not obtain secret for named key {}: {}", key_data.name, e))?;
         
-        let result = transformer_from_overrides(&overrides, &gr);
-        assert!(Arc::ptr_eq(&result, &transformer));
+        let block = create_aes_cipher(&key)
+            .map_err(|e| format!("error while creating cipher for named key {}: {}", key_data.name, e))?;
+        
+        let transformer = func(block)
+            .map_err(|e| format!("error while creating transformer for named key {}: {}", key_data.name, e))?;
+
+        // Create a new PrefixTransformer for this key
+        key_transformers.push(PrefixTransformer {
+            transformer,
+            prefix: format!("{}:", key_data.name).into_bytes(),
+        });
+    }
+
+    // Create a prefixTransformer which can choose between these keys
+    let key_transformer = Arc::new(PrefixTransformers::new(key_transformers));
+
+    // Create a PrefixTransformer which shall later be put in a list with other providers
+    Ok(PrefixTransformer {
+        transformer: key_transformer,
+        prefix: prefix.as_bytes().to_vec(),
+    })
+}
+
+fn secretbox_prefix_transformer(
+    config: &SecretboxConfiguration,
+) -> Result<PrefixTransformer, Box<dyn std::error::Error + Send + Sync>> {
+    if config.keys.is_empty() {
+        return Err("secretbox provider has no valid keys".into());
+    }
+
+    for key in &config.keys {
+        if key.name.is_empty() {
+            return Err("key with invalid name provided".into());
+        }
+        if key.secret.is_empty() {
+            return Err(format!("key {} has no provided secret", key.name).into());
+        }
+    }
+
+    let mut key_transformers = Vec::new();
+
+    for key_data in &config.keys {
+        let key = base64::decode(&key_data.secret)
+            .map_err(|e| format!("could not obtain secret for named key {}: {}", key_data.name, e))?;
+
+        if key.len() != 32 {
+            return Err(format!("expected key size 32 for secretbox provider, got {}", key.len()).into());
+        }
+
+        let mut key_array = [0u8; 32];
+        key_array.copy_from_slice(&key);
+
+        // Create a new PrefixTransformer for this key
+        key_transformers.push(PrefixTransformer {
+            transformer: Arc::new(SecretboxTransformer::new(key_array)),
+            prefix: format!("{}:", key_data.name).into_bytes(),
+        });
+    }
+
+    // Create a prefixTransformer which can choose between these keys
+    let key_transformer = Arc::new(PrefixTransformers::new(key_transformers));
+
+    // Create a PrefixTransformer which shall later be put in a list with other providers
+    Ok(PrefixTransformer {
+        transformer: key_transformer,
+        prefix: SECRETBOX_TRANSFORMER_PREFIX_V1.as_bytes().to_vec(),
+    })
+}
+
+/// kmsPrefixTransformer creates a KMS transformer and probe based on the given KMS config.
+/// It may launch multiple go routines whose lifecycle is controlled by ctx.
+/// In case of an error, the caller is responsible for canceling ctx to clean up any go routines that may have been launched.
+async fn kms_prefix_transformer(
+    ctx: Context,
+    config: &KMSConfiguration,
+    api_server_id: &str,
+) -> Result<(PrefixTransformer, Box<dyn HealthCheckerInterface>, KmsState), Box<dyn std::error::Error + Send + Sync>> {
+    let kms_name = &config.name;
+
+    match config.api_version.as_str() {
+        KMS_API_VERSION_V1 => {
+            if !is_kmsv1_enabled() {
+                return Err("KMSv1 is deprecated and will only receive security updates going forward. Use KMSv2 instead. Set --feature-gates=KMSv1=true to use the deprecated KMSv1 feature.".into());
+            }
+            // TODO: add logging
+            // klog.InfoS("KMSv1 is deprecated and will only receive security updates going forward. Use KMSv2 instead.")
+
+            let envelope_service = create_envelope_service(ctx.clone(), &config.endpoint, config.timeout)
+                .await
+                .map_err(|e| format!("could not configure KMSv1-Plugin's probe {:?}, error: {}", kms_name, e))?;
+
+            let probe = Box::new(KmsPluginProbe::new(
+                kms_name.clone(),
+                envelope_service.clone(),
+            )) as Box<dyn HealthCheckerInterface>;
+
+            let transformer = envelope_prefix_transformer(config, envelope_service, KMS_TRANSFORMER_PREFIX_V1);
+
+            Ok((
+                transformer,
+                probe,
+                KmsState {
+                    v1_used: true,
+                    // for v1 we will do encrypt and decrypt for health check. Since these are serial operations, we will double the timeout.
+                    kms_timeout_sum: config.timeout * 2,
+                    ..Default::default()
+                },
+            ))
+        }
+
+        KMS_API_VERSION_V2 => {
+            let envelope_service = create_envelope_kmsv2_service(ctx.clone(), &config.endpoint, &config.name, config.timeout)
+                .await
+                .map_err(|e| format!("could not configure KMSv2-Plugin's probe {:?}, error: {}", kms_name, e))?;
+
+            let probe = Box::new(Kmsv2PluginProbe::new(
+                kms_name.clone(),
+                envelope_service.clone(),
+                api_server_id.to_string(),
+            )) as Box<dyn HealthCheckerInterface>;
+
+            prime_and_probe_kmsv2(ctx.clone(), &probe, kms_name).await;
+
+            let transformer = PrefixTransformer {
+                transformer: Arc::new(EnvelopeKmsv2Transformer::new(
+                    envelope_service,
+                    kms_name.clone(),
+                    api_server_id.to_string(),
+                )),
+                prefix: format!("{}{}: ", KMS_TRANSFORMER_PREFIX_V2, kms_name).into_bytes(),
+            };
+
+            Ok((
+                transformer,
+                probe,
+                KmsState {
+                    v2_used: true,
+                    kms_timeout_sum: config.timeout,
+                    ..Default::default()
+                },
+            ))
+        }
+
+        _ => Err(format!(
+            "could not configure KMS plugin {:?}, unsupported KMS API version {:?}",
+            kms_name, config.api_version
+        ).into()),
+    }
+}
+
+async fn prime_and_probe_kmsv2(
+    ctx: Context,
+    probe: &Box<dyn HealthCheckerInterface>,
+    kms_name: &str,
+) {
+    let run_probe_check_and_log = |ctx: Context, depth: usize| async move {
+        // TODO: implement actual probe check
+        // if let Err(err) = probe.check(ctx).await {
+        //     klog.VDepth(1 + depth, 2).ErrorS(err, "kms plugin failed health check probe", "name", kms_name)
+        //     return Err(err);
+        // }
+        Ok(())
+    };
+
+    let block_and_probe_fast_until_success = |ctx: Context| async move {
+        loop {
+            if run_probe_check_and_log(ctx.clone(), 1).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(KMSV2_PLUGIN_HEALTHZ_NEGATIVE_INTERVAL).await;
+        }
+    };
+
+    // on the happy path where the plugin is healthy and available on server start,
+    // prime keyID and DEK by running the check inline once (this also prevents unit tests from flaking)
+    let err_prime = run_probe_check_and_log(ctx.clone(), 0).await;
+
+    // if our initial attempt to prime failed, start trying to get to a valid state in the background ASAP
+    // this prevents a slow start when the external healthz checker is configured to ignore the KMS healthz endpoint
+    // since we want to support the plugin starting up async with the API server, this error is not fatal
+    if err_prime.is_err() {
+        let ctx_clone = ctx.clone();
+        tokio::spawn(async move {
+            block_and_probe_fast_until_success(ctx_clone).await;
+        });
+    }
+
+    // make sure that the plugin's key ID is reasonably up-to-date
+    // also, make sure that our DEK is up-to-date to with said key ID (if it expires the server will fail all writes)
+    // if this background loop ever stops running, the server will become unfunctional after kmsv2PluginWriteDEKSourceMaxTTL
+    tokio::spawn(async move {
+        loop {
+            if run_probe_check_and_log(ctx.clone(), 0).await.is_err() {
+                // TODO add integration test for quicker error poll on failure
+                // if we fail, block the outer polling and start a new quicker poll inline
+                // this limits the chance that our DEK expires during a transient failure
+                block_and_probe_fast_until_success(ctx.clone()).await;
+            }
+            tokio::time::sleep(KMSV2_PLUGIN_HEALTHZ_POSITIVE_INTERVAL).await;
+        }
+    });
+}
+
+fn envelope_prefix_transformer(
+    config: &KMSConfiguration,
+    envelope_service: Arc<dyn EnvelopeService>,
+    prefix: &str,
+) -> PrefixTransformer {
+    let base_transformer_func = |block: Block| -> Result<Arc<dyn Transformer>, Box<dyn std::error::Error + Send + Sync>> {
+        let gcm = new_gcm_transformer(block)?;
+
+        // v1.24: write using AES-CBC only but support reads via AES-CBC and AES-GCM (so we can move to AES-GCM)
+        // v1.25: write using AES-GCM only but support reads via AES-GCM and fallback to AES-CBC for backwards compatibility
+        // TODO(aramase): Post v1.25: We cannot drop CBC read support until we automate storage migration.
+        // We could have a release note that hard requires users to perform storage migration.
+        Ok(Arc::new(UnionTransformers::new(vec![
+            gcm,
+            Arc::new(new_cbc_transformer(block)),
+        ])))
+    };
+
+    PrefixTransformer {
+        transformer: Arc::new(EnvelopeTransformer::new(
+            envelope_service,
+            config.cache_size as usize,
+            base_transformer_func,
+        )),
+        prefix: format!("{}{}: ", prefix, config.name).into_bytes(),
+    }
+}
+
+pub struct EncryptionConfiguration {
+    pub transformers: HashMap<GroupResource, Arc<dyn Transformer>>,
+    pub health_checks: Vec<Box<dyn HealthChecker>>,
+    pub encryption_file_content_hash: String,
+    pub kms_close_grace_period: Duration,
+}
+
+pub struct PrefixTransformer {
+    pub transformer: Arc<dyn Transformer>,
+    pub prefix: Vec<u8>,
+}
+
+struct PrefixTransformers {
+    transformers: Vec<PrefixTransformer>,
+}
+
+impl PrefixTransformers {
+    fn new(transformers: Vec<PrefixTransformer>) -> Self {
+        Self { transformers }
+    }
+}
+
+#[derive(Clone)]
+pub struct Context {
+    // Context implementation
+}
+
+impl Context {
+    pub fn background() -> Self {
+        Self {}
+    }
+}
+
+fn parse_group_resource(resource: &str) -> GroupResource {
+    // Parse resource string into GroupResource
+    GroupResource {
+        group: String::new(),
+        resource: resource.to_string(),
+    }
+}
+
+fn decode_encryption_config(_data: &[u8]) -> Result<EncryptionConfig, Box<dyn std::error::Error + Send + Sync>> {
+    // Decode encryption config from bytes
+    Ok(EncryptionConfig::default())
+}
+
+fn validate_encryption_configuration(_config: &EncryptionConfig, _reload: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Ok(())
+}
+
+fn is_kmsv1_enabled() -> bool {
+    false
+}
+
+async fn create_envelope_service(
+    _ctx: Context,
+    _endpoint: &str,
+    _timeout: Duration,
+) -> Result<Arc<dyn EnvelopeService>, Box<dyn std::error::Error + Send + Sync>> {
+    Err("not implemented".into())
+}
+
+async fn create_envelope_kmsv2_service(
+    _ctx: Context,
+    _endpoint: &str,
+    _name: &str,
+    _timeout: Duration,
+) -> Result<Arc<dyn KmsService>, Box<dyn std::error::Error + Send + Sync>> {
+    Err("not implemented".into())
+}
+
+#[derive(Default)]
+pub struct EncryptionConfig {
+    pub resources: Vec<ResourceConfiguration>,
+}
+
+#[derive(Default)]
+pub struct ResourceConfiguration {
+    pub resources: Vec<String>,
+    pub providers: Vec<Provider>,
+}
+
+pub enum Provider {
+    AESGCM(AESConfiguration),
+    AESCBC(AESConfiguration),
+    Secretbox(SecretboxConfiguration),
+    KMS(KMSConfiguration),
+    Identity,
+}
+
+pub struct AESConfiguration {
+    pub keys: Vec<KeyConfig>,
+}
+
+pub struct SecretboxConfiguration {
+    pub keys: Vec<KeyConfig>,
+}
+
+pub struct KMSConfiguration {
+    pub name: String,
+    pub api_version: String,
+    pub endpoint: String,
+    pub timeout: Duration,
+    pub cache_size: i32,
+}
+
+pub struct KeyConfig {
+    pub name: String,
+    pub secret: String,
+}
+
+pub struct Block;
+
+fn create_aes_cipher(_key: &[u8]) -> Result<Block, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(Block)
+}
+
+fn new_gcm_transformer(_block: Block) -> Result<Arc<dyn Transformer>, Box<dyn std::error::Error + Send + Sync>> {
+    Err("not implemented".into())
+}
+
+fn new_cbc_transformer(_block: Block) -> Arc<dyn Transformer> {
+    Arc::new(IdentityTransformer)
+}
+
+struct SecretboxTransformer;
+
+impl SecretboxTransformer {
+    fn new(_key: [u8; 32]) -> Self {
+        Self
+    }
+}
+
+struct EnvelopeTransformer;
+
+impl EnvelopeTransformer {
+    fn new(
+        _service: Arc<dyn EnvelopeService>,
+        _cache_size: usize,
+        _func: fn(Block) -> Result<Arc<dyn Transformer>, Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self
+    }
+}
+
+struct EnvelopeKmsv2Transformer;
+
+impl EnvelopeKmsv2Transformer {
+    fn new(_service: Arc<dyn KmsService>, _name: String, _api_server_id: String) -> Self {
+        Self
     }
 }
