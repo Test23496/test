@@ -1,862 +1,917 @@
-use std::time::{Duration, Instant};
-
-/// PrefixTransformer holds a transformer interface and the prefix that the transformation is located under.
-#[derive(Clone)]
-pub struct PrefixTransformer {
-    pub prefix: Vec<u8>,
-    pub transformer: Arc<dyn Transformer>,
-}
-
-pub struct PrefixTransformers {
-    transformers: Vec<PrefixTransformer>,
-    err: String,
-}
-
-impl PrefixTransformers {
-    /// NewPrefixTransformers supports the Transformer interface by checking the incoming data against the provided
-    /// prefixes in order. The first matching prefix will be used to transform the value (the prefix is stripped
-    /// before the Transformer interface is invoked). The first provided transformer will be used when writing to
-    /// the store.
-    pub fn new(err: Option<String>, transformers: Vec<PrefixTransformer>) -> Self {
-        let err = err.unwrap_or_else(|| {
-            "the provided value does not match any of the supported transformers".to_string()
-        });
-        
-        Self {
-            transformers,
-            err,
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Transformer for PrefixTransformers {
-    /// TransformFromStorage finds the first transformer with a prefix matching the provided data and returns
-    /// the result of transforming the value. It will always mark any transformation as stale that is not using
-    /// the first transformer.
-    async fn transform_from_storage(
-        &self,
-        ctx: Context,
-        data: &[u8],
-        data_ctx: &DataContext,
-    ) -> Result<TransformResult, Box<dyn std::error::Error + Send + Sync>> {
-        let start = Instant::now();
-        let mut errors = Vec::new();
-        let resource = get_resource_from_context(&ctx);
-
-        for (i, transformer) in self.transformers.iter().enumerate() {
-            if data.starts_with(&transformer.prefix) {
-                let stripped_data = &data[transformer.prefix.len()..];
-                let result = transformer.transformer.transform_from_storage(ctx.clone(), stripped_data, data_ctx).await;
-                
-                // To migrate away from encryption, user can specify an identity transformer higher up
-                // (in the config file) than the encryption transformer. In that scenario, the identity transformer needs to
-                // identify (during reads from disk) whether the data being read is encrypted or not. If the data is encrypted,
-                // it shall throw an error, but that error should not prevent the next subsequent transformer from being tried.
-                if transformer.prefix.is_empty() && result.is_err() {
-                    continue;
-                }
-
-                let prefix_str = if transformer.prefix.is_empty() {
-                    "identity"
-                } else {
-                    std::str::from_utf8(&transformer.prefix).unwrap_or("unknown")
-                };
-                
-                match &result {
-                    Ok(transform_result) => {
-                        record_transformation(&resource, "from_storage", prefix_str, start.elapsed(), None);
-                        
-                        // It is valid to have overlapping prefixes when the same encryption provider
-                        // is specified multiple times but with different keys (the first provider is
-                        // being rotated to and some later provider is being rotated away from).
-                        //
-                        // Example:
-                        //
-                        //  {
-                        //    "aescbc": {
-                        //      "keys": [
-                        //        {
-                        //          "name": "2",
-                        //          "secret": "some key 2"
-                        //        }
-                        //      ]
-                        //    }
-                        //  },
-                        //  {
-                        //    "aescbc": {
-                        //      "keys": [
-                        //        {
-                        //          "name": "1",
-                        //          "secret": "some key 1"
-                        //        }
-                        //      ]
-                        //    }
-                        //  },
-                        //
-                        // The transformers for both aescbc configs share the prefix k8s:enc:aescbc:v1:
-                        // but a failure in the first one should not prevent a later match from being attempted.
-                        // Thus we never short-circuit on a prefix match that results in an error.
-                        
-                        return Ok(TransformResult {
-                            data: transform_result.data.clone(),
-                            stale: transform_result.stale || i != 0,
-                        });
-                    }
-                    Err(err) => {
-                        record_transformation(&resource, "from_storage", prefix_str, start.elapsed(), Some(err));
-                        errors.push(err.to_string());
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if !errors.is_empty() {
-            let aggregate_err = errors.join("; ");
-            log_transform_err(&ctx, &aggregate_err, "failed to decrypt data");
-            return Err(aggregate_err.into());
-        }
-
-        record_transformation(&resource, "from_storage", "unknown", start.elapsed(), Some(&self.err));
-        Err(self.err.clone().into())
-    }
-
-    /// TransformToStorage uses the first transformer and adds its prefix to the data.
-    async fn transform_to_storage(
-        &self,
-        ctx: Context,
-        data: &[u8],
-        data_ctx: &DataContext,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        let start = Instant::now();
-        let transformer = &self.transformers[0];
-        let resource = get_resource_from_context(&ctx);
-        
-        let result = transformer.transformer.transform_to_storage(ctx.clone(), data, data_ctx).await;
-        
-        let prefix_str = std::str::from_utf8(&transformer.prefix).unwrap_or("unknown");
-        
-        match result {
-            Ok(encrypted_data) => {
-                record_transformation(&resource, "to_storage", prefix_str, start.elapsed(), None);
-                
-                let mut prefixed_data = Vec::with_capacity(transformer.prefix.len() + encrypted_data.len());
-                prefixed_data.extend_from_slice(&transformer.prefix);
-                prefixed_data.extend_from_slice(&encrypted_data);
-                
-                Ok(prefixed_data)
-            }
-            Err(err) => {
-                record_transformation(&resource, "to_storage", prefix_str, start.elapsed(), Some(&err));
-                log_transform_err(&ctx, &err.to_string(), "failed to encrypt data");
-                Err(err)
-            }
-        }
-    }
-}
-
-fn log_transform_err(ctx: &Context, err: &str, message: &str) {
-    let request_info = get_request_info_from_context(ctx);
-    
-    // TODO: implement proper logging with klog equivalent
-    // if klog_level_6_enabled() {
-    //     klog.InfoSDepth(1, message, "err", err, "group", request_info.api_group, ...);
-    //     return;
-    // }
-    
-    eprintln!("ERROR: {} - {}: {:?}", message, err, request_info);
-}
-
-fn get_request_info_from_context(ctx: &Context) -> RequestInfo {
-    // TODO: implement actual request info extraction from context
-    ctx.request_info.clone().unwrap_or_default()
-}
-
-fn get_resource_from_context(ctx: &Context) -> String {
-    let req_info = get_request_info_from_context(ctx);
-    format!("{}.{}", req_info.resource, req_info.api_group)
-}
-
-fn record_transformation(
-    resource: &str,
-    direction: &str,
-    transformer_type: &str,
-    duration: Duration,
-    error: Option<&dyn std::error::Error>,
-) {
-    // TODO: implement metrics recording
-    // This would typically record to Prometheus or similar metrics system
-    let _ = (resource, direction, transformer_type, duration, error);
-}
-
-#[derive(Clone, Default, Debug)]
-pub struct RequestInfo {
-    pub api_group: String,
-    pub api_version: String,
-    pub resource: String,
-    pub subresource: String,
-    pub verb: String,
-    pub namespace: String,
-    pub name: String,
-}
-
-#[derive(Clone)]
-pub struct Context {
-    pub request_info: Option<RequestInfo>,
-}
-
-impl Context {
-    pub fn background() -> Self {
-        Self {
-            request_info: None,
-        }
-    }
-    
-    pub fn with_request_info(request_info: RequestInfo) -> Self {
-        Self {
-            request_info: Some(request_info),
-        }
-    }
-}
-
-pub struct DataContext {
-    // Additional context for data transformation
-}
-
-impl DataContext {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl Default for DataContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub struct TransformResult {
-    pub data: Vec<u8>,
-    pub stale: bool,
-}
-
-impl TransformResult {
-    pub fn new(data: Vec<u8>, stale: bool) -> Self {
-        Self { data, stale }
-    }
-}
-
-#[async_trait::async_trait]
-pub trait Transformer: Send + Sync {
-    async fn transform_from_storage(
-        &self,
-        ctx: Context,
-        data: &[u8],
-        data_ctx: &DataContext,
-    ) -> Result<TransformResult, Box<dyn std::error::Error + Send + Sync>>;
-
-    async fn transform_to_storage(
-        &self,
-        ctx: Context,
-        data: &[u8],
-        data_ctx: &DataContext,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>>;
-}
-
-use std::sync::Arc;
-========================================================
-
 use std::collections::HashSet;
-
-const MORE_THAN_ONE_ELEMENT_ERR: &str = "more than one provider specified in a single element, should split into different list elements";
-const KEY_LEN_ERR_FMT: &str = "secret is not of the expected length, got %d, expected one of %v";
-const UNSUPPORTED_SCHEME_ERR_FMT: &str = "unsupported scheme %q for KMS provider, only unix is supported";
-const UNSUPPORTED_KMS_API_VERSION_ERR_FMT: &str = "unsupported apiVersion %s for KMS provider, only v1 and v2 are supported";
-const AT_LEAST_ONE_REQUIRED_ERR_FMT: &str = "at least one %s is required";
-const INVALID_URL_ERR_FMT: &str = "invalid endpoint for kms provider, error: %v";
-const MANDATORY_FIELD_ERR_FMT: &str = "%s is a mandatory field for a %s";
-const BASE64_ENCODING_ERR: &str = "secrets must be base64 encoded";
-const ZERO_OR_NEGATIVE_ERR_FMT: &str = "%s should be a positive value";
-const NON_ZERO_ERR_FMT: &str = "%s should be a positive value, or negative to disable";
-const ENCRYPTION_CONFIG_NIL_ERR: &str = "EncryptionConfiguration can't be nil";
-const INVALID_KMS_CONFIG_NAME_ERR_FMT: &str = "invalid KMS provider name %s, must not contain ':'";
-const DUPLICATE_KMS_CONFIG_NAME_ERR_FMT: &str = "duplicate KMS provider name %s, names must be unique";
-const EVENTS_GROUP_ERR: &str = "'*.events.k8s.io' objects are stored using the 'events' API group in etcd. Use 'events' instead in the config file";
-const EXTENSIONS_GROUP_ERR: &str = "'extensions' group has been removed and cannot be used for encryption";
-const STAR_RESOURCE_ERR: &str = "use '*.' to encrypt all the resources from core API group or *.* to encrypt all resources";
-const OVERLAP_ERR: &str = "using overlapping resources such as 'secrets' and '*.' in the same resource list is not allowed as they will be masked";
-const NON_REST_API_RESOURCE_ERR: &str = "resources which do not have REST API/s cannot be encrypted";
-const RESOURCE_NAME_ERR: &str = "resource name should not contain capital letters";
-const RESOURCE_ACROSS_GROUP_ERR: &str = "encrypting the same resource across groups is not supported";
-const DUPLICATE_RESOURCE_ERR: &str = "the same resource cannot be specified multiple times";
-
-// See https://golang.org/pkg/crypto/aes/#NewCipher for details on supported key sizes for AES.
-const AES_KEY_SIZES: &[usize] = &[16, 24, 32];
-
-// See https://godoc.org/golang.org/x/crypto/nacl/secretbox#Open for details on the supported key sizes for Secretbox.
-const SECRET_BOX_KEY_SIZES: &[usize] = &[32];
-
-/// ValidateEncryptionConfiguration validates a v1.EncryptionConfiguration.
-pub fn validate_encryption_configuration(
-    config: Option<&EncryptionConfiguration>,
-    reload: bool,
-) -> Vec<FieldError> {
-    let root = FieldPath::new("resources");
-    let mut all_errors = Vec::new();
-
-    let Some(c) = config else {
-        all_errors.push(FieldError::required(root.clone(), ENCRYPTION_CONFIG_NIL_ERR));
-        return all_errors;
-    };
-
-    if c.resources.is_empty() {
-        all_errors.push(FieldError::required(
-            root.clone(),
-            &format!("{}", AT_LEAST_ONE_REQUIRED_ERR_FMT.replace("%s", "resources")),
-        ));
-        return all_errors;
-    }
-
-    // kmsProviderNames is used to track config names to ensure they are unique.
-    let mut kms_provider_names = HashSet::new();
-
-    for (i, conf) in c.resources.iter().enumerate() {
-        let r = root.index(i).child("resources");
-        let p = root.index(i).child("providers");
-
-        if conf.resources.is_empty() {
-            all_errors.push(FieldError::required(
-                r.clone(),
-                &format!("{}", AT_LEAST_ONE_REQUIRED_ERR_FMT.replace("%s", &r.to_string())),
-            ));
-        }
-
-        all_errors.extend(validate_resource_overlap(&conf.resources, &r));
-        all_errors.extend(validate_resource_names(&conf.resources, &r));
-
-        if conf.providers.is_empty() {
-            all_errors.push(FieldError::required(
-                p.clone(),
-                &format!("{}", AT_LEAST_ONE_REQUIRED_ERR_FMT.replace("%s", &p.to_string())),
-            ));
-        }
-
-        for (j, provider) in conf.providers.iter().enumerate() {
-            let path = p.index(j);
-            all_errors.extend(validate_single_provider(provider, &path));
-
-            match provider {
-                ProviderConfiguration::KMS(kms_config) => {
-                    all_errors.extend(validate_kms_configuration(
-                        kms_config,
-                        &path.child("kms"),
-                        &kms_provider_names,
-                        reload,
-                    ));
-                    kms_provider_names.insert(kms_config.name.clone());
-                }
-                ProviderConfiguration::AESGCM(aes_config) => {
-                    all_errors.extend(validate_keys(
-                        &aes_config.keys,
-                        &path.child("aesgcm").child("keys"),
-                        AES_KEY_SIZES,
-                    ));
-                }
-                ProviderConfiguration::AESCBC(aes_config) => {
-                    all_errors.extend(validate_keys(
-                        &aes_config.keys,
-                        &path.child("aescbc").child("keys"),
-                        AES_KEY_SIZES,
-                    ));
-                }
-                ProviderConfiguration::Secretbox(secretbox_config) => {
-                    all_errors.extend(validate_keys(
-                        &secretbox_config.keys,
-                        &path.child("secretbox").child("keys"),
-                        SECRET_BOX_KEY_SIZES,
-                    ));
-                }
-                ProviderConfiguration::Identity => {}
-            }
-        }
-    }
-
-    all_errors
-}
-
-static ANY_GROUP_ANY_RESOURCE: once_cell::sync::Lazy<GroupResource> = once_cell::sync::Lazy::new(|| {
-    GroupResource {
-        group: "*".to_string(),
-        resource: "*".to_string(),
-    }
-});
-
-fn validate_resource_overlap(resources: &[String], field_path: &FieldPath) -> Vec<FieldError> {
-    if resources.len() < 2 {
-        // cannot have overlap with a single resource
-        return vec![];
-    }
-
-    let mut all_errors = Vec::new();
-
-    let r: Vec<GroupResource> = resources
-        .iter()
-        .map(|resource| parse_group_resource(resource))
-        .collect();
-
-    let mut has_overlap = false;
-    let mut has_duplicate = false;
-
-    for (i, r1) in r.iter().enumerate() {
-        for (j, r2) in r.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-
-            if r1 == r2 && !has_duplicate {
-                has_duplicate = true;
-                continue;
-            }
-
-            if has_overlap {
-                continue;
-            }
-
-            if r1 == &*ANY_GROUP_ANY_RESOURCE {
-                has_overlap = true;
-                continue;
-            }
-
-            if r1.group != r2.group {
-                continue;
-            }
-
-            if r1.resource == "*" || r2.resource == "*" {
-                has_overlap = true;
-                continue;
-            }
-        }
-    }
-
-    if has_duplicate {
-        all_errors.push(FieldError::invalid(
-            field_path.clone(),
-            format!("{:?}", resources),
-            DUPLICATE_RESOURCE_ERR,
-        ));
-    }
-
-    if has_overlap {
-        all_errors.push(FieldError::invalid(
-            field_path.clone(),
-            format!("{:?}", resources),
-            OVERLAP_ERR,
-        ));
-    }
-
-    all_errors
-}
-
-fn validate_resource_names(resources: &[String], field_path: &FieldPath) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    for (j, res) in resources.iter().enumerate() {
-        let jj = field_path.index(j);
-
-        // check if resource name has capital letters
-        if has_capital(res) {
-            all_errors.push(FieldError::invalid(
-                jj.clone(),
-                res.clone(),
-                RESOURCE_NAME_ERR,
-            ));
-            continue;
-        }
-
-        // check if resource is '*'
-        if res == "*" {
-            all_errors.push(FieldError::invalid(
-                jj.clone(),
-                res.clone(),
-                STAR_RESOURCE_ERR,
-            ));
-            continue;
-        }
-
-        // check if resource is:
-        // 'apiserveripinfo' OR
-        // 'serviceipallocations' OR
-        // 'servicenodeportallocations' OR
-        if res == "apiserveripinfo"
-            || res == "serviceipallocations"
-            || res == "servicenodeportallocations"
-        {
-            all_errors.push(FieldError::invalid(
-                jj.clone(),
-                res.clone(),
-                NON_REST_API_RESOURCE_ERR,
-            ));
-            continue;
-        }
-
-        // check if group is 'events.k8s.io'
-        let gr = parse_group_resource(res);
-        if gr.group == "events.k8s.io" {
-            all_errors.push(FieldError::invalid(
-                jj.clone(),
-                res.clone(),
-                EVENTS_GROUP_ERR,
-            ));
-            continue;
-        }
-
-        // check if group is 'extensions'
-        if gr.group == "extensions" {
-            all_errors.push(FieldError::invalid(
-                jj.clone(),
-                res.clone(),
-                EXTENSIONS_GROUP_ERR,
-            ));
-            continue;
-        }
-
-        // disallow resource.* as encrypting the same resource across groups does not make sense
-        if gr.group == "*" && gr.resource != "*" {
-            all_errors.push(FieldError::invalid(
-                jj.clone(),
-                res.clone(),
-                RESOURCE_ACROSS_GROUP_ERR,
-            ));
-            continue;
-        }
-    }
-
-    all_errors
-}
-
-fn validate_single_provider(
-    provider: &ProviderConfiguration,
-    field_path: &FieldPath,
-) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-    let mut found = 0;
-
-    match provider {
-        ProviderConfiguration::KMS(_) => found += 1,
-        ProviderConfiguration::AESGCM(_) => found += 1,
-        ProviderConfiguration::AESCBC(_) => found += 1,
-        ProviderConfiguration::Secretbox(_) => found += 1,
-        ProviderConfiguration::Identity => found += 1,
-    }
-
-    if found == 0 {
-        all_errors.push(FieldError::invalid(
-            field_path.clone(),
-            format!("{:?}", provider),
-            "provider does not contain any of the expected providers: KMS, AESGCM, AESCBC, Secretbox, Identity",
-        ));
-    }
-
-    if found > 1 {
-        all_errors.push(FieldError::invalid(
-            field_path.clone(),
-            format!("{:?}", provider),
-            MORE_THAN_ONE_ELEMENT_ERR,
-        ));
-    }
-
-    all_errors
-}
-
-fn validate_keys(
-    keys: &[Key],
-    field_path: &FieldPath,
-    expected_len: &[usize],
-) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    if keys.is_empty() {
-        all_errors.push(FieldError::required(
-            field_path.clone(),
-            &AT_LEAST_ONE_REQUIRED_ERR_FMT.replace("%s", "keys"),
-        ));
-        return all_errors;
-    }
-
-    for (i, key) in keys.iter().enumerate() {
-        all_errors.extend(validate_key(key, &field_path.index(i), expected_len));
-    }
-
-    all_errors
-}
-
-fn validate_key(key: &Key, field_path: &FieldPath, expected_len: &[usize]) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    if key.name.is_empty() {
-        all_errors.push(FieldError::required(
-            field_path.child("name"),
-            &MANDATORY_FIELD_ERR_FMT.replace("%s", "name").replace("%s", "key"),
-        ));
-    }
-
-    if key.secret.is_empty() {
-        all_errors.push(FieldError::required(
-            field_path.child("secret"),
-            &MANDATORY_FIELD_ERR_FMT.replace("%s", "secret").replace("%s", "key"),
-        ));
-        return all_errors;
-    }
-
-    let secret = match base64::decode(&key.secret) {
-        Ok(s) => s,
-        Err(_) => {
-            all_errors.push(FieldError::invalid(
-                field_path.child("secret"),
-                "REDACTED".to_string(),
-                BASE64_ENCODING_ERR,
-            ));
-            return all_errors;
-        }
-    };
-
-    let len_matched = expected_len.iter().any(|&l| secret.len() == l);
-
-    if !len_matched {
-        all_errors.push(FieldError::invalid(
-            field_path.child("secret"),
-            "REDACTED".to_string(),
-            &format!(
-                "secret is not of the expected length, got {}, expected one of {:?}",
-                secret.len(),
-                expected_len
-            ),
-        ));
-    }
-
-    all_errors
-}
-
-fn validate_kms_configuration(
-    config: &KMSConfiguration,
-    field_path: &FieldPath,
-    kms_provider_names: &HashSet<String>,
-    reload: bool,
-) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    all_errors.extend(validate_kms_config_name(
-        config,
-        &field_path.child("name"),
-        kms_provider_names,
-        reload,
-    ));
-    all_errors.extend(validate_kms_timeout(config, &field_path.child("timeout")));
-    all_errors.extend(validate_kms_endpoint(config, &field_path.child("endpoint")));
-    all_errors.extend(validate_kms_cache_size(config, &field_path.child("cachesize")));
-    all_errors.extend(validate_kms_api_version(config, &field_path.child("apiVersion")));
-
-    all_errors
-}
-
-fn validate_kms_cache_size(config: &KMSConfiguration, field_path: &FieldPath) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    // In defaulting, we set the cache size to the default value only when API version is v1.
-    // So, for v2 API version, we expect the cache size field to be nil.
-    if config.api_version != "v1" && config.cache_size.is_some() {
-        all_errors.push(FieldError::invalid(
-            field_path.clone(),
-            format!("{:?}", config.cache_size),
-            "cachesize is not supported in v2",
-        ));
-    }
-
-    if config.api_version == "v1" {
-        if let Some(cache_size) = config.cache_size {
-            if cache_size == 0 {
-                all_errors.push(FieldError::invalid(
-                    field_path.clone(),
-                    cache_size.to_string(),
-                    &NON_ZERO_ERR_FMT.replace("%s", "cachesize"),
-                ));
-            }
-        }
-    }
-
-    all_errors
-}
-
-fn validate_kms_timeout(config: &KMSConfiguration, field_path: &FieldPath) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    if config.timeout <= Duration::ZERO {
-        all_errors.push(FieldError::invalid(
-            field_path.clone(),
-            format!("{:?}", config.timeout),
-            &ZERO_OR_NEGATIVE_ERR_FMT.replace("%s", "timeout"),
-        ));
-    }
-
-    all_errors
-}
-
-fn validate_kms_endpoint(config: &KMSConfiguration, field_path: &FieldPath) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    if config.endpoint.is_empty() {
-        return vec![FieldError::invalid(
-            field_path.clone(),
-            "".to_string(),
-            &MANDATORY_FIELD_ERR_FMT.replace("%s", "endpoint").replace("%s", "kms"),
-        )];
-    }
-
-    let u = match url::Url::parse(&config.endpoint) {
-        Ok(url) => url,
-        Err(err) => {
-            return vec![FieldError::invalid(
-                field_path.clone(),
-                config.endpoint.clone(),
-                &INVALID_URL_ERR_FMT.replace("%v", &err.to_string()),
-            )];
-        }
-    };
-
-    if u.scheme() != "unix" {
-        return vec![FieldError::invalid(
-            field_path.clone(),
-            config.endpoint.clone(),
-            &UNSUPPORTED_SCHEME_ERR_FMT.replace("%q", u.scheme()),
-        )];
-    }
-
-    all_errors
-}
-
-fn validate_kms_api_version(config: &KMSConfiguration, field_path: &FieldPath) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    if config.api_version != "v1" && config.api_version != "v2" {
-        all_errors.push(FieldError::invalid(
-            field_path.clone(),
-            config.api_version.clone(),
-            &UNSUPPORTED_KMS_API_VERSION_ERR_FMT.replace("%s", "apiVersion"),
-        ));
-    }
-
-    all_errors
-}
-
-fn validate_kms_config_name(
-    config: &KMSConfiguration,
-    field_path: &FieldPath,
-    kms_provider_names: &HashSet<String>,
-    reload: bool,
-) -> Vec<FieldError> {
-    let mut all_errors = Vec::new();
-
-    if config.name.is_empty() {
-        all_errors.push(FieldError::required(
-            field_path.clone(),
-            &MANDATORY_FIELD_ERR_FMT.replace("%s", "name").replace("%s", "provider"),
-        ));
-    }
-
-    // kms v2 providers are not allowed to have a ":" in their name
-    if config.api_version != "v1" && config.name.contains(':') {
-        all_errors.push(FieldError::invalid(
-            field_path.clone(),
-            config.name.clone(),
-            &INVALID_KMS_CONFIG_NAME_ERR_FMT.replace("%s", &config.name),
-        ));
-    }
-
-    // kms v2 providers name must always be unique across all kms providers (v1 and v2)
-    // kms v1 provider names must be unique across all kms providers (v1 and v2) when hot reloading of encryption configuration is enabled (reload=true)
-    if reload || config.api_version != "v1" {
-        if kms_provider_names.contains(&config.name) {
-            all_errors.push(FieldError::invalid(
-                field_path.clone(),
-                config.name.clone(),
-                &DUPLICATE_KMS_CONFIG_NAME_ERR_FMT.replace("%s", &config.name),
-            ));
-        }
-    }
-
-    all_errors
-}
-
-fn has_capital(input: &str) -> bool {
-    input != input.to_lowercase()
-}
-
-#[derive(Debug, Clone)]
-pub struct FieldError {
-    pub field: FieldPath,
-    pub value: String,
-    pub message: String,
-    pub error_type: FieldErrorType,
-}
-
-#[derive(Debug, Clone)]
-pub enum FieldErrorType {
-    Required,
-    Invalid,
-}
-
-impl FieldError {
-    pub fn required(field: FieldPath, message: &str) -> Self {
-        Self {
-            field,
-            value: String::new(),
-            message: message.to_string(),
-            error_type: FieldErrorType::Required,
-        }
-    }
-
-    pub fn invalid(field: FieldPath, value: String, message: &str) -> Self {
-        Self {
-            field,
-            value,
-            message: message.to_string(),
-            error_type: FieldErrorType::Invalid,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FieldPath {
-    segments: Vec<String>,
-}
-
-impl FieldPath {
-    pub fn new(root: &str) -> Self {
-        Self {
-            segments: vec![root.to_string()],
-        }
-    }
-
-    pub fn child(&self, name: &str) -> Self {
-        let mut segments = self.segments.clone();
-        segments.push(name.to_string());
-        Self { segments }
-    }
-
-    pub fn index(&self, i: usize) -> Self {
-        let mut segments = self.segments.clone();
-        segments.push(format!("[{}]", i));
-        Self { segments }
-    }
-}
-
-impl std::fmt::Display for FieldPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.segments.join("."))
-    }
-}
-
+use std::sync::Arc;
 use std::time::Duration;
-use url;
+use bytes::Bytes;
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::{
+    Api, Client, ResourceExt,
+    api::{ListParams, PostParams, Patch, PatchParams},
+    runtime::{
+        controller::{Action, Controller as KubeController},
+        watcher, reflector,
+    },
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use tokio::time;
+use x509_parser::prelude::*;
 
+const CONFIG_MAP_NAMESPACE: &str = "kube-system";
+const CONFIG_MAP_NAME: &str = "extension-apiserver-authentication";
+
+/// Controller holds the running state for the controller
+pub struct Controller {
+    required_authentication_data: ClusterAuthenticationInfo,
+    client: Client,
+    config_map_api: Api<ConfigMap>,
+    namespace_api: Api<Namespace>,
+}
+
+/// ClusterAuthenticationInfo holds the information that will included in public configmap.
+#[derive(Clone, Default)]
+pub struct ClusterAuthenticationInfo {
+    /// ClientCA is the CA that can be used to verify the identity of normal clients
+    pub client_ca: Option<Arc<dyn CAContentProvider>>,
+
+    /// RequestHeaderUsernameHeaders are the headers used by this kube-apiserver to determine username
+    pub request_header_username_headers: Option<Arc<dyn StringSliceProvider>>,
+    /// RequestHeaderUIDHeaders are the headers used by this kube-apiserver to determine UID
+    pub request_header_uid_headers: Option<Arc<dyn StringSliceProvider>>,
+    /// RequestHeaderGroupHeaders are the headers used by this kube-apiserver to determine groups
+    pub request_header_group_headers: Option<Arc<dyn StringSliceProvider>>,
+    /// RequestHeaderExtraHeaderPrefixes are the headers used by this kube-apiserver to determine user.extra
+    pub request_header_extra_header_prefixes: Option<Arc<dyn StringSliceProvider>>,
+    /// RequestHeaderAllowedNames are the subjects allowed to act as a front proxy
+    pub request_header_allowed_names: Option<Arc<dyn StringSliceProvider>>,
+    /// RequestHeaderCA is the CA that can be used to verify the front proxy
+    pub request_header_ca: Option<Arc<dyn CAContentProvider>>,
+}
+
+pub trait CAContentProvider: Send + Sync {
+    fn current_ca_bundle_content(&self) -> Vec<u8>;
+}
+
+pub trait StringSliceProvider: Send + Sync {
+    fn value(&self) -> Vec<String>;
+}
+
+struct StaticCAContent {
+    name: String,
+    content: Vec<u8>,
+}
+
+impl CAContentProvider for StaticCAContent {
+    fn current_ca_bundle_content(&self) -> Vec<u8> {
+        self.content.clone()
+    }
+}
+
+struct StaticStringSlice {
+    values: Vec<String>,
+}
+
+impl StringSliceProvider for StaticStringSlice {
+    fn value(&self) -> Vec<String> {
+        self.values.clone()
+    }
+}
+
+impl Controller {
+    /// NewClusterAuthenticationTrustController returns a controller that will maintain the kube-system configmap/extension-apiserver-authentication
+    /// that holds information about how to aggregated apiservers are recommended (but not required) to configure themselves.
+    pub fn new(
+        required_authentication_data: ClusterAuthenticationInfo,
+        client: Client,
+    ) -> Self {
+        let config_map_api: Api<ConfigMap> = Api::namespaced(client.clone(), CONFIG_MAP_NAMESPACE);
+        let namespace_api: Api<Namespace> = Api::all(client.clone());
+
+        Self {
+            required_authentication_data,
+            client,
+            config_map_api,
+            namespace_api,
+        }
+    }
+
+    async fn sync_config_map(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let original_auth_config_map = match self.config_map_api.get(CONFIG_MAP_NAME).await {
+            Ok(cm) => cm,
+            Err(kube::Error::Api(err)) if err.code == 404 => {
+                ConfigMap {
+                    metadata: ObjectMeta {
+                        namespace: Some(CONFIG_MAP_NAMESPACE.to_string()),
+                        name: Some(CONFIG_MAP_NAME.to_string()),
+                        ..Default::default()
+                    },
+                    data: None,
+                    ..Default::default()
+                }
+            }
+            Err(e) => return Err(Box::new(e)),
+        };
+
+        // keep the original to diff against later before updating
+        let mut auth_config_map = original_auth_config_map.clone();
+
+        let existing_authentication_info = get_cluster_authentication_info_for(
+            original_auth_config_map.data.as_ref()
+        )?;
+        let combined_info = combined_cluster_authentication_info(
+            existing_authentication_info,
+            self.required_authentication_data.clone(),
+        )?;
+        auth_config_map.data = Some(get_config_map_data_for(&combined_info)?);
+
+        if auth_config_map == original_auth_config_map {
+            log::debug!("no changes to configmap");
+            return Ok(());
+        }
+        log::info!(
+            "writing updated authentication info to {} configmaps/{}",
+            CONFIG_MAP_NAMESPACE,
+            CONFIG_MAP_NAME
+        );
+
+        create_namespace_if_needed(&self.namespace_api, CONFIG_MAP_NAMESPACE).await?;
+        write_config_map(&self.config_map_api, &auth_config_map).await?;
+
+        Ok(())
+    }
+
+    /// Run the controller until stopped.
+    pub async fn run(&self, workers: usize) -> Result<(), Box<dyn std::error::Error>> {
+        log::info!("Starting cluster_authentication_trust_controller controller");
+
+        let mut interval = time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Err(e) = self.sync_config_map().await {
+                log::error!("Failed to sync config map: {:?}", e);
+            }
+        }
+    }
+
+    /// Enqueue a method to allow separate control loops to cause the controller to trigger and reconcile content.
+    pub async fn enqueue(&self) {
+        if let Err(e) = self.sync_config_map().await {
+            log::error!("Failed to sync config map: {:?}", e);
+        }
+    }
+}
+
+async fn create_namespace_if_needed(
+    namespace_api: &Api<Namespace>,
+    ns: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match namespace_api.get(ns).await {
+        Ok(_) => {
+            // the namespace already exists
+            return Ok(());
+        }
+        Err(_) => {}
+    }
+
+    let new_ns = Namespace {
+        metadata: ObjectMeta {
+            name: Some(ns.to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    match namespace_api.create(&PostParams::default(), &new_ns).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(err)) if err.code == 409 => Ok(()), // AlreadyExists
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
+async fn write_config_map(
+    config_map_api: &Api<ConfigMap>,
+    required: &ConfigMap,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let name = required.name_any();
+    
+    match config_map_api
+        .replace(&name, &PostParams::default(), required)
+        .await
+    {
+        Ok(_) => return Ok(()),
+        Err(kube::Error::Api(err)) if err.code == 404 => {
+            return match config_map_api.create(&PostParams::default(), required).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(Box::new(e)),
+            };
+        }
+        Err(e) => {
+            // If the configmap is too big, clear the entire thing and count on this controller (or another one) to add the correct data back.
+            // We return the original error which causes the controller to re-queue.
+            // Too big means
+            //   1. request is so big the generic request catcher finds it
+            //   2. the content is so large that that the server sends a validation error "Too long: must have at most 1048576 characters"
+            if e.to_string().contains("too large") || 
+               (e.to_string().contains("Invalid") && e.to_string().contains("Too long")) {
+                if let Err(delete_err) = config_map_api.delete(&name, &Default::default()).await {
+                    return Err(Box::new(delete_err));
+                }
+            }
+            return Err(Box::new(e));
+        }
+    }
+}
+
+/// combinedClusterAuthenticationInfo combines two sets of authentication information into a new one
+fn combined_cluster_authentication_info(
+    lhs: ClusterAuthenticationInfo,
+    rhs: ClusterAuthenticationInfo,
+) -> Result<ClusterAuthenticationInfo, Box<dyn std::error::Error>> {
+    let ret = ClusterAuthenticationInfo {
+        request_header_allowed_names: combine_unique_string_slices(
+            lhs.request_header_allowed_names.as_ref(),
+            rhs.request_header_allowed_names.as_ref(),
+        ),
+        request_header_extra_header_prefixes: combine_unique_string_slices(
+            lhs.request_header_extra_header_prefixes.as_ref(),
+            rhs.request_header_extra_header_prefixes.as_ref(),
+        ),
+        request_header_group_headers: combine_unique_string_slices(
+            lhs.request_header_group_headers.as_ref(),
+            rhs.request_header_group_headers.as_ref(),
+        ),
+        request_header_username_headers: combine_unique_string_slices(
+            lhs.request_header_username_headers.as_ref(),
+            rhs.request_header_username_headers.as_ref(),
+        ),
+        request_header_uid_headers: combine_unique_string_slices(
+            lhs.request_header_uid_headers.as_ref(),
+            rhs.request_header_uid_headers.as_ref(),
+        ),
+        client_ca: combine_cert_lists(lhs.client_ca.as_ref(), rhs.client_ca.as_ref())?,
+        request_header_ca: combine_cert_lists(
+            lhs.request_header_ca.as_ref(),
+            rhs.request_header_ca.as_ref(),
+        )?,
+    };
+
+    Ok(ret)
+}
+
+fn get_config_map_data_for(
+    authentication_info: &ClusterAuthenticationInfo,
+) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let mut data = std::collections::BTreeMap::new();
+    
+    if let Some(client_ca) = &authentication_info.client_ca {
+        let ca_bytes = client_ca.current_ca_bundle_content();
+        if !ca_bytes.is_empty() {
+            data.insert("client-ca-file".to_string(), String::from_utf8(ca_bytes)?);
+        }
+    }
+
+    if authentication_info.request_header_ca.is_none() {
+        return Ok(data);
+    }
+
+    if let Some(request_header_ca) = &authentication_info.request_header_ca {
+        let ca_bytes = request_header_ca.current_ca_bundle_content();
+        if !ca_bytes.is_empty() {
+            // encoding errors aren't going to get better, so just fail on them.
+            if let Some(headers) = &authentication_info.request_header_username_headers {
+                data.insert(
+                    "requestheader-username-headers".to_string(),
+                    json_serialize_string_slice(&headers.value())?,
+                );
+            }
+
+            // Note: Feature gate check for RemoteRequestHeaderUID would go here
+            if let Some(uid_headers) = &authentication_info.request_header_uid_headers {
+                if !uid_headers.value().is_empty() {
+                    data.insert(
+                        "requestheader-uid-headers".to_string(),
+                        json_serialize_string_slice(&uid_headers.value())?,
+                    );
+                }
+            }
+
+            if let Some(group_headers) = &authentication_info.request_header_group_headers {
+                data.insert(
+                    "requestheader-group-headers".to_string(),
+                    json_serialize_string_slice(&group_headers.value())?,
+                );
+            }
+
+            if let Some(extra_prefixes) = &authentication_info.request_header_extra_header_prefixes {
+                data.insert(
+                    "requestheader-extra-headers-prefix".to_string(),
+                    json_serialize_string_slice(&extra_prefixes.value())?,
+                );
+            }
+
+            data.insert(
+                "requestheader-client-ca-file".to_string(),
+                String::from_utf8(ca_bytes)?,
+            );
+
+            if let Some(allowed_names) = &authentication_info.request_header_allowed_names {
+                data.insert(
+                    "requestheader-allowed-names".to_string(),
+                    json_serialize_string_slice(&allowed_names.value())?,
+                );
+            }
+        }
+    }
+
+    Ok(data)
+}
+
+fn get_cluster_authentication_info_for(
+    data: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<ClusterAuthenticationInfo, Box<dyn std::error::Error>> {
+    let mut ret = ClusterAuthenticationInfo::default();
+
+    let data = match data {
+        Some(d) => d,
+        None => return Ok(ret),
+    };
+
+    ret.request_header_group_headers = json_deserialize_string_slice(
+        data.get("requestheader-group-headers").map(|s| s.as_str()),
+    )?;
+    ret.request_header_extra_header_prefixes = json_deserialize_string_slice(
+        data.get("requestheader-extra-headers-prefix").map(|s| s.as_str()),
+    )?;
+    ret.request_header_allowed_names = json_deserialize_string_slice(
+        data.get("requestheader-allowed-names").map(|s| s.as_str()),
+    )?;
+    ret.request_header_username_headers = json_deserialize_string_slice(
+        data.get("requestheader-username-headers").map(|s| s.as_str()),
+    )?;
+
+    // Note: Feature gate check for RemoteRequestHeaderUID would go here
+    ret.request_header_uid_headers = json_deserialize_string_slice(
+        data.get("requestheader-uid-headers").map(|s| s.as_str()),
+    )?;
+
+    if let Some(ca_bundle) = data.get("requestheader-client-ca-file") {
+        if !ca_bundle.is_empty() {
+            ret.request_header_ca = Some(Arc::new(StaticCAContent {
+                name: "existing".to_string(),
+                content: ca_bundle.as_bytes().to_vec(),
+            }));
+        }
+    }
+
+    if let Some(ca_bundle) = data.get("client-ca-file") {
+        if !ca_bundle.is_empty() {
+            ret.client_ca = Some(Arc::new(StaticCAContent {
+                name: "existing".to_string(),
+                content: ca_bundle.as_bytes().to_vec(),
+            }));
+        }
+    }
+
+    Ok(ret)
+}
+
+fn json_serialize_string_slice(input: &[String]) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(serde_json::to_string(input)?)
+}
+
+fn json_deserialize_string_slice(
+    input: Option<&str>,
+) -> Result<Option<Arc<dyn StringSliceProvider>>, Box<dyn std::error::Error>> {
+    match input {
+        None | Some("") => Ok(None),
+        Some(s) => {
+            let out: Vec<String> = serde_json::from_str(s)?;
+            Ok(Some(Arc::new(StaticStringSlice { values: out })))
+        }
+    }
+}
+
+fn combine_unique_string_slices(
+    lhs: Option<&Arc<dyn StringSliceProvider>>,
+    rhs: Option<&Arc<dyn StringSliceProvider>>,
+) -> Option<Arc<dyn StringSliceProvider>> {
+    let mut ret = Vec::new();
+    let mut present = HashSet::new();
+
+    if let Some(lhs) = lhs {
+        for curr in lhs.value() {
+            if !present.contains(&curr) {
+                ret.push(curr.clone());
+                present.insert(curr);
+            }
+        }
+    }
+
+    if let Some(rhs) = rhs {
+        for curr in rhs.value() {
+            if !present.contains(&curr) {
+                ret.push(curr.clone());
+                present.insert(curr);
+            }
+        }
+    }
+
+    if ret.is_empty() {
+        None
+    } else {
+        Some(Arc::new(StaticStringSlice { values: ret }))
+    }
+}
+
+fn combine_cert_lists(
+    lhs: Option<&Arc<dyn CAContentProvider>>,
+    rhs: Option<&Arc<dyn CAContentProvider>>,
+) -> Result<Option<Arc<dyn CAContentProvider>>, Box<dyn std::error::Error>> {
+    let mut certificates = Vec::new();
+
+    if let Some(lhs) = lhs {
+        let lhs_ca_bytes = lhs.current_ca_bundle_content();
+        let lhs_cas = parse_certs_pem(&lhs_ca_bytes)?;
+        certificates.extend(lhs_cas);
+    }
+
+    if let Some(rhs) = rhs {
+        let rhs_ca_bytes = rhs.current_ca_bundle_content();
+        let rhs_cas = parse_certs_pem(&rhs_ca_bytes)?;
+        certificates.extend(rhs_cas);
+    }
+
+    certificates = filter_expired_certs(certificates);
+
+    let mut final_certificates = Vec::new();
+    // now check for duplicates. n^2, but super simple
+    for i in 0..certificates.len() {
+        let mut found = false;
+        for j in 0..final_certificates.len() {
+            if certificates[i] == final_certificates[j] {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            final_certificates.push(certificates[i].clone());
+        }
+    }
+
+    let final_ca_bytes = encode_certificates(&final_certificates)?;
+
+    if final_ca_bytes.is_empty() {
+        return Ok(None);
+    }
+
+    // it makes sense for this list to be static because the combination of sources is only used just before writing and
+    // is recalculated
+    Ok(Some(Arc::new(StaticCAContent {
+        name: "combined".to_string(),
+        content: final_ca_bytes,
+    })))
+}
+
+/// filterExpiredCerts checks are all certificates in the bundle valid, i.e. they have not expired.
+/// The function returns new bundle with only valid certificates or error if no valid certificate is found.
+/// We allow five minutes of slack for NotAfter comparisons
+fn filter_expired_certs(certs: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let five_minutes_ago = std::time::SystemTime::now() - Duration::from_secs(5 * 60);
+
+    certs
+        .into_iter()
+        .filter(|cert_der| {
+            if let Ok((_, cert)) = X509Certificate::from_der(cert_der) {
+                let not_after = cert.validity().not_after.timestamp();
+                let five_min_timestamp = five_minutes_ago
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                not_after > five_min_timestamp
+            } else {
+                false
+            }
+        })
+        .collect()
+}
+
+fn key_fn() -> String {
+    // this format matches DeletionHandlingMetaNamespaceKeyFunc for our single key
+    format!("{}/{}", CONFIG_MAP_NAMESPACE, CONFIG_MAP_NAME)
+}
+
+fn encode_certificates(certs: &[Vec<u8>]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut buffer = Vec::new();
+    for cert in certs {
+        let pem = pem::encode(&pem::Pem {
+            tag: "CERTIFICATE".to_string(),
+            contents: cert.clone(),
+        });
+        buffer.extend_from_slice(pem.as_bytes());
+    }
+    Ok(buffer)
+}
+
+fn parse_certs_pem(pem_data: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let pem_str = std::str::from_utf8(pem_data)?;
+    let pems = pem::parse_many(pem_str)?;
+    Ok(pems.into_iter().map(|p| p.contents).collect())
+}
+============================================
+
+
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::time;
+use k8s_openapi::api::core::v1::{
+    EndpointPort, Service, ServicePort, ServiceSpec,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+use kube::{Api, Client, Error as KubeError};
+use kube::runtime::reflector::{ObjectRef, Store};
+
+const KUBERNETES_SERVICE_NAME: &str = "kubernetes";
+
+/// Controller is the controller manager for the core bootstrap Kubernetes
+/// controller loops, which manage creating the "kubernetes" service and
+/// provide the IP repair check on service IPs
+pub struct Controller {
+    config: Config,
+    client: Client,
+    service_lister: Store<Service>,
+    service_synced: bool,
+    lock: Mutex<()>,
+    stop_tx: Option<mpsc::Sender<()>>,
+}
+
+pub struct Config {
+    pub public_ip: IpAddr,
+    pub endpoint_reconciler: Box<dyn EndpointReconciler>,
+    pub endpoint_interval: Duration,
+    
+    /// ServiceIP indicates where the kubernetes service will live. It may not be nil.
+    pub service_ip: IpAddr,
+    pub service_port: i32,
+    pub public_service_port: i32,
+    pub kubernetes_service_node_port: i32,
+}
+
+pub trait EndpointReconciler: Send + Sync {
+    fn remove_endpoints(
+        &self,
+        service_name: &str,
+        ip: IpAddr,
+        ports: Vec<EndpointPort>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    
+    fn reconcile_endpoints(
+        &self,
+        service_name: &str,
+        ip: IpAddr,
+        ports: Vec<EndpointPort>,
+        reconcile: bool,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    
+    fn stop_reconciling(&self);
+    fn destroy(&self);
+}
+
+impl Controller {
+    /// New returns a controller for watching the kubernetes service endpoints.
+    pub fn new(
+        config: Config,
+        client: Client,
+        service_lister: Store<Service>,
+    ) -> Self {
+        Controller {
+            config,
+            client,
+            service_lister,
+            service_synced: false,
+            lock: Mutex::new(()),
+            stop_tx: None,
+        }
+    }
+
+    /// Start begins the core controller loops that must exist for bootstrapping
+    /// a cluster.
+    pub async fn start(&mut self, mut stop_rx: mpsc::Receiver<()>) {
+        if !self.wait_for_cache_sync(&mut stop_rx).await {
+            eprintln!("timed out waiting for caches to sync");
+            return;
+        }
+
+        // Reconcile during first run removing itself until server is ready.
+        let endpoint_ports = create_endpoint_port_spec(self.config.public_service_port, "https");
+        match self.config.endpoint_reconciler.remove_endpoints(
+            KUBERNETES_SERVICE_NAME,
+            self.config.public_ip,
+            endpoint_ports.clone(),
+        ) {
+            Ok(_) => {
+                eprintln!("Found stale data, removed previous endpoints on kubernetes service, apiserver didn't exit successfully previously");
+            }
+            Err(e) if !is_not_found(&e) => {
+                eprintln!("Error removing old endpoints from kubernetes service: {:?}", e);
+            }
+            _ => {}
+        }
+
+        let (local_stop_tx, mut local_stop_rx) = mpsc::channel(1);
+        
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = stop_rx.recv() => {}, // from Start
+                _ = local_stop_rx.recv() => {}, // from Stop
+            }
+        });
+
+        self.run(local_stop_rx).await;
+    }
+
+    /// Stop cleans up this API Servers endpoint reconciliation leases so another master can take over more quickly.
+    pub async fn stop(&mut self) {
+        let _guard = self.lock.lock().unwrap();
+
+        if let Some(stop_tx) = self.stop_tx.take() {
+            let _ = stop_tx.send(()).await;
+        } else {
+            return; // only close once
+        }
+
+        let endpoint_ports = create_endpoint_port_spec(self.config.public_service_port, "https");
+        let reconciler = &self.config.endpoint_reconciler;
+        let public_ip = self.config.public_ip;
+        let endpoint_interval = self.config.endpoint_interval;
+
+        let finished = tokio::spawn(async move {
+            println!("Shutting down kubernetes service endpoint reconciler");
+            reconciler.stop_reconciling();
+            if let Err(e) = reconciler.remove_endpoints(
+                KUBERNETES_SERVICE_NAME,
+                public_ip,
+                endpoint_ports,
+            ) {
+                eprintln!("Unable to remove endpoints from kubernetes service: {:?}", e);
+            }
+            reconciler.destroy();
+        });
+
+        match tokio::time::timeout(2 * endpoint_interval, finished).await {
+            Ok(_) => {
+                // done
+            }
+            Err(_) => {
+                // don't block server shutdown forever if we can't reach etcd to remove ourselves
+                eprintln!("RemoveEndpoints() timed out");
+            }
+        }
+    }
+
+    /// Run periodically updates the kubernetes service
+    pub async fn run(&self, mut stop_rx: mpsc::Receiver<()>) {
+        // wait until process is ready
+        let ready = self.wait_for_ready(&mut stop_rx).await;
+        if !ready {
+            return;
+        }
+
+        let mut interval = time::interval(self.config.endpoint_interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Service definition is not reconciled after first
+                    // run, ports and type will be corrected only during
+                    // start.
+                    if let Err(e) = self.update_kubernetes_service(false).await {
+                        eprintln!("unable to sync kubernetes service: {:?}", e);
+                    }
+                }
+                _ = stop_rx.recv() => {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// UpdateKubernetesService attempts to update the default Kube service.
+    pub async fn update_kubernetes_service(&self, reconcile: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // Update service & endpoint records.
+        let (service_ports, service_type) = create_port_and_service_spec(
+            self.config.service_port,
+            self.config.public_service_port,
+            self.config.kubernetes_service_node_port,
+            "https",
+        );
+        
+        self.create_or_update_master_service_if_needed(
+            KUBERNETES_SERVICE_NAME,
+            self.config.service_ip,
+            service_ports,
+            service_type.clone(),
+            reconcile,
+        ).await?;
+        
+        let endpoint_ports = create_endpoint_port_spec(self.config.public_service_port, "https");
+        self.config.endpoint_reconciler.reconcile_endpoints(
+            KUBERNETES_SERVICE_NAME,
+            self.config.public_ip,
+            endpoint_ports,
+            reconcile,
+        )?;
+        
+        Ok(())
+    }
+
+    /// CreateOrUpdateMasterServiceIfNeeded will create the specified service if it
+    /// doesn't already exist.
+    async fn create_or_update_master_service_if_needed(
+        &self,
+        service_name: &str,
+        service_ip: IpAddr,
+        service_ports: Vec<ServicePort>,
+        service_type: String,
+        reconcile: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let services: Api<Service> = Api::default_namespaced(self.client.clone());
+        
+        if let Some(s) = self.service_lister.get(&ObjectRef::new(service_name).within("default")) {
+            // The service already exists.
+            // This path is no executed since 1.17 2a9a9fa, keeping it in case it needs to be revisited
+            if reconcile {
+                if let Some((svc, true)) = get_master_service_update_if_needed(
+                    s,
+                    service_ports.clone(),
+                    service_type.clone(),
+                ) {
+                    eprintln!("Resetting master service {:?} to {:?}", service_name, svc);
+                    services.replace(service_name, &Default::default(), &svc).await?;
+                }
+            }
+            return Ok(());
+        }
+
+        let single_stack = "SingleStack".to_string();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("provider".to_string(), "kubernetes".to_string());
+        labels.insert("component".to_string(), "apiserver".to_string());
+
+        let svc = Service {
+            metadata: ObjectMeta {
+                name: Some(service_name.to_string()),
+                namespace: Some("default".to_string()),
+                labels: Some(labels),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                ports: Some(service_ports.clone()),
+                // maintained by this code, not by the pod selector
+                selector: None,
+                cluster_ip: Some(service_ip.to_string()),
+                ip_family_policy: Some(single_stack),
+                session_affinity: Some("None".to_string()),
+                type_: Some(service_type.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        match services.create(&Default::default(), &svc).await {
+            Ok(_) => Ok(()),
+            Err(KubeError::Api(api_err)) if api_err.code == 409 => {
+                // AlreadyExists
+                self.create_or_update_master_service_if_needed(
+                    service_name,
+                    service_ip,
+                    service_ports,
+                    service_type,
+                    reconcile,
+                ).await
+            }
+            Err(e) => Err(Box::new(e)),
+        }
+    }
+
+    async fn wait_for_cache_sync(&self, stop_rx: &mut mpsc::Receiver<()>) -> bool {
+        // Simplified implementation - in real code would wait for informer sync
+        true
+    }
+
+    async fn wait_for_ready(&self, stop_rx: &mut mpsc::Receiver<()>) -> bool {
+        let mut interval = time::interval(Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Check readiness endpoint
+                    // Simplified - in real code would check /readyz
+                    return true;
+                }
+                _ = stop_rx.recv() => {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+/// createPortAndServiceSpec creates an array of service ports.
+/// If the NodePort value is 0, just the servicePort is used, otherwise, a node port is exposed.
+fn create_port_and_service_spec(
+    service_port: i32,
+    target_service_port: i32,
+    node_port: i32,
+    service_port_name: &str,
+) -> (Vec<ServicePort>, String) {
+    // Use the Cluster IP type for the service port if NodePort isn't provided.
+    // Otherwise, we will be binding the master service to a NodePort.
+    let mut service_ports = vec![ServicePort {
+        protocol: Some("TCP".to_string()),
+        port: service_port,
+        name: Some(service_port_name.to_string()),
+        target_port: Some(IntOrString::Int(target_service_port)),
+        ..Default::default()
+    }];
+    
+    let mut service_type = "ClusterIP".to_string();
+    if node_port > 0 {
+        service_ports[0].node_port = Some(node_port);
+        service_type = "NodePort".to_string();
+    }
+    
+    (service_ports, service_type)
+}
+
+/// createEndpointPortSpec creates the endpoint ports
+fn create_endpoint_port_spec(endpoint_port: i32, endpoint_port_name: &str) -> Vec<EndpointPort> {
+    vec![EndpointPort {
+        protocol: Some("TCP".to_string()),
+        port: endpoint_port,
+        name: Some(endpoint_port_name.to_string()),
+        ..Default::default()
+    }]
+}
+
+/// getMasterServiceUpdateIfNeeded sets service attributes for the given apiserver service.
+fn get_master_service_update_if_needed(
+    svc: &Service,
+    service_ports: Vec<ServicePort>,
+    service_type: String,
+) -> Option<(Service, bool)> {
+    // Determine if the service is in the format we expect
+    // (servicePorts are present and service type matches)
+    let format_correct = check_service_format(svc, &service_ports, &service_type);
+    if format_correct {
+        return Some((svc.clone(), false));
+    }
+    
+    let mut updated_svc = svc.clone();
+    if let Some(ref mut spec) = updated_svc.spec {
+        spec.ports = Some(service_ports);
+        spec.type_ = Some(service_type);
+    }
+    
+    Some((updated_svc, true))
+}
+
+/// Determine if the service is in the correct format
+/// getMasterServiceUpdateIfNeeded expects (servicePorts are correct
+/// and service type matches).
+fn check_service_format(
+    s: &Service,
+    ports: &[ServicePort],
+    service_type: &str,
+) -> bool {
+    let spec = match &s.spec {
+        Some(spec) => spec,
+        None => return false,
+    };
+    
+    if spec.type_.as_deref() != Some(service_type) {
+        return false;
+    }
+    
+    let s_ports = match &spec.ports {
+        Some(p) => p,
+        None => return false,
+    };
+    
+    if ports.len() != s_ports.len() {
+        return false;
+    }
+    
+    for (i, port) in ports.iter().enumerate() {
+        if port != &s_ports[i] {
+            return false;
+        }
+    }
+    
+    true
+}
+
+fn is_not_found(err: &Box<dyn std::error::Error>) -> bool {
+    // Simplified - in real code would check for specific NotFound error
+    err.to_string().contains("not found")
+}
