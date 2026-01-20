@@ -1,917 +1,903 @@
-use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use bytes::Bytes;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::{
-    Api, Client, ResourceExt,
-    api::{ListParams, PostParams, Patch, PatchParams},
-    runtime::{
-        controller::{Action, Controller as KubeController},
-        watcher, reflector,
-    },
-};
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::time;
-use x509_parser::prelude::*;
-
-const CONFIG_MAP_NAMESPACE: &str = "kube-system";
-const CONFIG_MAP_NAME: &str = "extension-apiserver-authentication";
-
-/// Controller holds the running state for the controller
-pub struct Controller {
-    required_authentication_data: ClusterAuthenticationInfo,
-    client: Client,
-    config_map_api: Api<ConfigMap>,
-    namespace_api: Api<Namespace>,
-}
-
-/// ClusterAuthenticationInfo holds the information that will included in public configmap.
-#[derive(Clone, Default)]
-pub struct ClusterAuthenticationInfo {
-    /// ClientCA is the CA that can be used to verify the identity of normal clients
-    pub client_ca: Option<Arc<dyn CAContentProvider>>,
-
-    /// RequestHeaderUsernameHeaders are the headers used by this kube-apiserver to determine username
-    pub request_header_username_headers: Option<Arc<dyn StringSliceProvider>>,
-    /// RequestHeaderUIDHeaders are the headers used by this kube-apiserver to determine UID
-    pub request_header_uid_headers: Option<Arc<dyn StringSliceProvider>>,
-    /// RequestHeaderGroupHeaders are the headers used by this kube-apiserver to determine groups
-    pub request_header_group_headers: Option<Arc<dyn StringSliceProvider>>,
-    /// RequestHeaderExtraHeaderPrefixes are the headers used by this kube-apiserver to determine user.extra
-    pub request_header_extra_header_prefixes: Option<Arc<dyn StringSliceProvider>>,
-    /// RequestHeaderAllowedNames are the subjects allowed to act as a front proxy
-    pub request_header_allowed_names: Option<Arc<dyn StringSliceProvider>>,
-    /// RequestHeaderCA is the CA that can be used to verify the front proxy
-    pub request_header_ca: Option<Arc<dyn CAContentProvider>>,
-}
-
-pub trait CAContentProvider: Send + Sync {
-    fn current_ca_bundle_content(&self) -> Vec<u8>;
-}
-
-pub trait StringSliceProvider: Send + Sync {
-    fn value(&self) -> Vec<String>;
-}
-
-struct StaticCAContent {
-    name: String,
-    content: Vec<u8>,
-}
-
-impl CAContentProvider for StaticCAContent {
-    fn current_ca_bundle_content(&self) -> Vec<u8> {
-        self.content.clone()
-    }
-}
-
-struct StaticStringSlice {
-    values: Vec<String>,
-}
-
-impl StringSliceProvider for StaticStringSlice {
-    fn value(&self) -> Vec<String> {
-        self.values.clone()
-    }
-}
-
-impl Controller {
-    /// NewClusterAuthenticationTrustController returns a controller that will maintain the kube-system configmap/extension-apiserver-authentication
-    /// that holds information about how to aggregated apiservers are recommended (but not required) to configure themselves.
-    pub fn new(
-        required_authentication_data: ClusterAuthenticationInfo,
-        client: Client,
-    ) -> Self {
-        let config_map_api: Api<ConfigMap> = Api::namespaced(client.clone(), CONFIG_MAP_NAMESPACE);
-        let namespace_api: Api<Namespace> = Api::all(client.clone());
-
-        Self {
-            required_authentication_data,
-            client,
-            config_map_api,
-            namespace_api,
-        }
-    }
-
-    async fn sync_config_map(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let original_auth_config_map = match self.config_map_api.get(CONFIG_MAP_NAME).await {
-            Ok(cm) => cm,
-            Err(kube::Error::Api(err)) if err.code == 404 => {
-                ConfigMap {
-                    metadata: ObjectMeta {
-                        namespace: Some(CONFIG_MAP_NAMESPACE.to_string()),
-                        name: Some(CONFIG_MAP_NAME.to_string()),
-                        ..Default::default()
-                    },
-                    data: None,
-                    ..Default::default()
-                }
-            }
-            Err(e) => return Err(Box::new(e)),
-        };
-
-        // keep the original to diff against later before updating
-        let mut auth_config_map = original_auth_config_map.clone();
-
-        let existing_authentication_info = get_cluster_authentication_info_for(
-            original_auth_config_map.data.as_ref()
-        )?;
-        let combined_info = combined_cluster_authentication_info(
-            existing_authentication_info,
-            self.required_authentication_data.clone(),
-        )?;
-        auth_config_map.data = Some(get_config_map_data_for(&combined_info)?);
-
-        if auth_config_map == original_auth_config_map {
-            log::debug!("no changes to configmap");
-            return Ok(());
-        }
-        log::info!(
-            "writing updated authentication info to {} configmaps/{}",
-            CONFIG_MAP_NAMESPACE,
-            CONFIG_MAP_NAME
-        );
-
-        create_namespace_if_needed(&self.namespace_api, CONFIG_MAP_NAMESPACE).await?;
-        write_config_map(&self.config_map_api, &auth_config_map).await?;
-
-        Ok(())
-    }
-
-    /// Run the controller until stopped.
-    pub async fn run(&self, workers: usize) -> Result<(), Box<dyn std::error::Error>> {
-        log::info!("Starting cluster_authentication_trust_controller controller");
-
-        let mut interval = time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Err(e) = self.sync_config_map().await {
-                log::error!("Failed to sync config map: {:?}", e);
-            }
-        }
-    }
-
-    /// Enqueue a method to allow separate control loops to cause the controller to trigger and reconcile content.
-    pub async fn enqueue(&self) {
-        if let Err(e) = self.sync_config_map().await {
-            log::error!("Failed to sync config map: {:?}", e);
-        }
-    }
-}
-
-async fn create_namespace_if_needed(
-    namespace_api: &Api<Namespace>,
-    ns: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match namespace_api.get(ns).await {
-        Ok(_) => {
-            // the namespace already exists
-            return Ok(());
-        }
-        Err(_) => {}
-    }
-
-    let new_ns = Namespace {
-        metadata: ObjectMeta {
-            name: Some(ns.to_string()),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    match namespace_api.create(&PostParams::default(), &new_ns).await {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(err)) if err.code == 409 => Ok(()), // AlreadyExists
-        Err(e) => Err(Box::new(e)),
-    }
-}
-
-async fn write_config_map(
-    config_map_api: &Api<ConfigMap>,
-    required: &ConfigMap,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let name = required.name_any();
-    
-    match config_map_api
-        .replace(&name, &PostParams::default(), required)
-        .await
-    {
-        Ok(_) => return Ok(()),
-        Err(kube::Error::Api(err)) if err.code == 404 => {
-            return match config_map_api.create(&PostParams::default(), required).await {
-                Ok(_) => Ok(()),
-                Err(e) => Err(Box::new(e)),
-            };
-        }
-        Err(e) => {
-            // If the configmap is too big, clear the entire thing and count on this controller (or another one) to add the correct data back.
-            // We return the original error which causes the controller to re-queue.
-            // Too big means
-            //   1. request is so big the generic request catcher finds it
-            //   2. the content is so large that that the server sends a validation error "Too long: must have at most 1048576 characters"
-            if e.to_string().contains("too large") || 
-               (e.to_string().contains("Invalid") && e.to_string().contains("Too long")) {
-                if let Err(delete_err) = config_map_api.delete(&name, &Default::default()).await {
-                    return Err(Box::new(delete_err));
-                }
-            }
-            return Err(Box::new(e));
-        }
-    }
-}
-
-/// combinedClusterAuthenticationInfo combines two sets of authentication information into a new one
-fn combined_cluster_authentication_info(
-    lhs: ClusterAuthenticationInfo,
-    rhs: ClusterAuthenticationInfo,
-) -> Result<ClusterAuthenticationInfo, Box<dyn std::error::Error>> {
-    let ret = ClusterAuthenticationInfo {
-        request_header_allowed_names: combine_unique_string_slices(
-            lhs.request_header_allowed_names.as_ref(),
-            rhs.request_header_allowed_names.as_ref(),
-        ),
-        request_header_extra_header_prefixes: combine_unique_string_slices(
-            lhs.request_header_extra_header_prefixes.as_ref(),
-            rhs.request_header_extra_header_prefixes.as_ref(),
-        ),
-        request_header_group_headers: combine_unique_string_slices(
-            lhs.request_header_group_headers.as_ref(),
-            rhs.request_header_group_headers.as_ref(),
-        ),
-        request_header_username_headers: combine_unique_string_slices(
-            lhs.request_header_username_headers.as_ref(),
-            rhs.request_header_username_headers.as_ref(),
-        ),
-        request_header_uid_headers: combine_unique_string_slices(
-            lhs.request_header_uid_headers.as_ref(),
-            rhs.request_header_uid_headers.as_ref(),
-        ),
-        client_ca: combine_cert_lists(lhs.client_ca.as_ref(), rhs.client_ca.as_ref())?,
-        request_header_ca: combine_cert_lists(
-            lhs.request_header_ca.as_ref(),
-            rhs.request_header_ca.as_ref(),
-        )?,
-    };
-
-    Ok(ret)
-}
-
-fn get_config_map_data_for(
-    authentication_info: &ClusterAuthenticationInfo,
-) -> Result<std::collections::BTreeMap<String, String>, Box<dyn std::error::Error>> {
-    let mut data = std::collections::BTreeMap::new();
-    
-    if let Some(client_ca) = &authentication_info.client_ca {
-        let ca_bytes = client_ca.current_ca_bundle_content();
-        if !ca_bytes.is_empty() {
-            data.insert("client-ca-file".to_string(), String::from_utf8(ca_bytes)?);
-        }
-    }
-
-    if authentication_info.request_header_ca.is_none() {
-        return Ok(data);
-    }
-
-    if let Some(request_header_ca) = &authentication_info.request_header_ca {
-        let ca_bytes = request_header_ca.current_ca_bundle_content();
-        if !ca_bytes.is_empty() {
-            // encoding errors aren't going to get better, so just fail on them.
-            if let Some(headers) = &authentication_info.request_header_username_headers {
-                data.insert(
-                    "requestheader-username-headers".to_string(),
-                    json_serialize_string_slice(&headers.value())?,
-                );
-            }
-
-            // Note: Feature gate check for RemoteRequestHeaderUID would go here
-            if let Some(uid_headers) = &authentication_info.request_header_uid_headers {
-                if !uid_headers.value().is_empty() {
-                    data.insert(
-                        "requestheader-uid-headers".to_string(),
-                        json_serialize_string_slice(&uid_headers.value())?,
-                    );
-                }
-            }
-
-            if let Some(group_headers) = &authentication_info.request_header_group_headers {
-                data.insert(
-                    "requestheader-group-headers".to_string(),
-                    json_serialize_string_slice(&group_headers.value())?,
-                );
-            }
-
-            if let Some(extra_prefixes) = &authentication_info.request_header_extra_header_prefixes {
-                data.insert(
-                    "requestheader-extra-headers-prefix".to_string(),
-                    json_serialize_string_slice(&extra_prefixes.value())?,
-                );
-            }
-
-            data.insert(
-                "requestheader-client-ca-file".to_string(),
-                String::from_utf8(ca_bytes)?,
-            );
-
-            if let Some(allowed_names) = &authentication_info.request_header_allowed_names {
-                data.insert(
-                    "requestheader-allowed-names".to_string(),
-                    json_serialize_string_slice(&allowed_names.value())?,
-                );
-            }
-        }
-    }
-
-    Ok(data)
-}
-
-fn get_cluster_authentication_info_for(
-    data: Option<&std::collections::BTreeMap<String, String>>,
-) -> Result<ClusterAuthenticationInfo, Box<dyn std::error::Error>> {
-    let mut ret = ClusterAuthenticationInfo::default();
-
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(ret),
-    };
-
-    ret.request_header_group_headers = json_deserialize_string_slice(
-        data.get("requestheader-group-headers").map(|s| s.as_str()),
-    )?;
-    ret.request_header_extra_header_prefixes = json_deserialize_string_slice(
-        data.get("requestheader-extra-headers-prefix").map(|s| s.as_str()),
-    )?;
-    ret.request_header_allowed_names = json_deserialize_string_slice(
-        data.get("requestheader-allowed-names").map(|s| s.as_str()),
-    )?;
-    ret.request_header_username_headers = json_deserialize_string_slice(
-        data.get("requestheader-username-headers").map(|s| s.as_str()),
-    )?;
-
-    // Note: Feature gate check for RemoteRequestHeaderUID would go here
-    ret.request_header_uid_headers = json_deserialize_string_slice(
-        data.get("requestheader-uid-headers").map(|s| s.as_str()),
-    )?;
-
-    if let Some(ca_bundle) = data.get("requestheader-client-ca-file") {
-        if !ca_bundle.is_empty() {
-            ret.request_header_ca = Some(Arc::new(StaticCAContent {
-                name: "existing".to_string(),
-                content: ca_bundle.as_bytes().to_vec(),
-            }));
-        }
-    }
-
-    if let Some(ca_bundle) = data.get("client-ca-file") {
-        if !ca_bundle.is_empty() {
-            ret.client_ca = Some(Arc::new(StaticCAContent {
-                name: "existing".to_string(),
-                content: ca_bundle.as_bytes().to_vec(),
-            }));
-        }
-    }
-
-    Ok(ret)
-}
-
-fn json_serialize_string_slice(input: &[String]) -> Result<String, Box<dyn std::error::Error>> {
-    Ok(serde_json::to_string(input)?)
-}
-
-fn json_deserialize_string_slice(
-    input: Option<&str>,
-) -> Result<Option<Arc<dyn StringSliceProvider>>, Box<dyn std::error::Error>> {
-    match input {
-        None | Some("") => Ok(None),
-        Some(s) => {
-            let out: Vec<String> = serde_json::from_str(s)?;
-            Ok(Some(Arc::new(StaticStringSlice { values: out })))
-        }
-    }
-}
-
-fn combine_unique_string_slices(
-    lhs: Option<&Arc<dyn StringSliceProvider>>,
-    rhs: Option<&Arc<dyn StringSliceProvider>>,
-) -> Option<Arc<dyn StringSliceProvider>> {
-    let mut ret = Vec::new();
-    let mut present = HashSet::new();
-
-    if let Some(lhs) = lhs {
-        for curr in lhs.value() {
-            if !present.contains(&curr) {
-                ret.push(curr.clone());
-                present.insert(curr);
-            }
-        }
-    }
-
-    if let Some(rhs) = rhs {
-        for curr in rhs.value() {
-            if !present.contains(&curr) {
-                ret.push(curr.clone());
-                present.insert(curr);
-            }
-        }
-    }
-
-    if ret.is_empty() {
-        None
-    } else {
-        Some(Arc::new(StaticStringSlice { values: ret }))
-    }
-}
-
-fn combine_cert_lists(
-    lhs: Option<&Arc<dyn CAContentProvider>>,
-    rhs: Option<&Arc<dyn CAContentProvider>>,
-) -> Result<Option<Arc<dyn CAContentProvider>>, Box<dyn std::error::Error>> {
-    let mut certificates = Vec::new();
-
-    if let Some(lhs) = lhs {
-        let lhs_ca_bytes = lhs.current_ca_bundle_content();
-        let lhs_cas = parse_certs_pem(&lhs_ca_bytes)?;
-        certificates.extend(lhs_cas);
-    }
-
-    if let Some(rhs) = rhs {
-        let rhs_ca_bytes = rhs.current_ca_bundle_content();
-        let rhs_cas = parse_certs_pem(&rhs_ca_bytes)?;
-        certificates.extend(rhs_cas);
-    }
-
-    certificates = filter_expired_certs(certificates);
-
-    let mut final_certificates = Vec::new();
-    // now check for duplicates. n^2, but super simple
-    for i in 0..certificates.len() {
-        let mut found = false;
-        for j in 0..final_certificates.len() {
-            if certificates[i] == final_certificates[j] {
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            final_certificates.push(certificates[i].clone());
-        }
-    }
-
-    let final_ca_bytes = encode_certificates(&final_certificates)?;
-
-    if final_ca_bytes.is_empty() {
-        return Ok(None);
-    }
-
-    // it makes sense for this list to be static because the combination of sources is only used just before writing and
-    // is recalculated
-    Ok(Some(Arc::new(StaticCAContent {
-        name: "combined".to_string(),
-        content: final_ca_bytes,
-    })))
-}
-
-/// filterExpiredCerts checks are all certificates in the bundle valid, i.e. they have not expired.
-/// The function returns new bundle with only valid certificates or error if no valid certificate is found.
-/// We allow five minutes of slack for NotAfter comparisons
-fn filter_expired_certs(certs: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
-    let five_minutes_ago = std::time::SystemTime::now() - Duration::from_secs(5 * 60);
-
-    certs
-        .into_iter()
-        .filter(|cert_der| {
-            if let Ok((_, cert)) = X509Certificate::from_der(cert_der) {
-                let not_after = cert.validity().not_after.timestamp();
-                let five_min_timestamp = five_minutes_ago
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-                not_after > five_min_timestamp
-            } else {
-                false
-            }
-        })
-        .collect()
-}
-
-fn key_fn() -> String {
-    // this format matches DeletionHandlingMetaNamespaceKeyFunc for our single key
-    format!("{}/{}", CONFIG_MAP_NAMESPACE, CONFIG_MAP_NAME)
-}
-
-fn encode_certificates(certs: &[Vec<u8>]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut buffer = Vec::new();
-    for cert in certs {
-        let pem = pem::encode(&pem::Pem {
-            tag: "CERTIFICATE".to_string(),
-            contents: cert.clone(),
-        });
-        buffer.extend_from_slice(pem.as_bytes());
-    }
-    Ok(buffer)
-}
-
-fn parse_certs_pem(pem_data: &[u8]) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
-    let pem_str = std::str::from_utf8(pem_data)?;
-    let pems = pem::parse_many(pem_str)?;
-    Ok(pems.into_iter().map(|p| p.contents).collect())
-}
-============================================
-
-
-use std::net::IpAddr;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time;
-use k8s_openapi::api::core::v1::{
-    EndpointPort, Service, ServicePort, ServiceSpec,
+use k8s_openapi::api::core::v1 as v1;
+use k8s_openapi::api::networking::v1 as networkingapiv1;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1 as metav1;
+use kube::{
+    Api, Client, ResourceExt,
+    runtime::{controller::Action, watcher, Controller as KubeController, reflector},
 };
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use kube::{Api, Client, Error as KubeError};
-use kube::runtime::reflector::{ObjectRef, Store};
+use kube::api::{ListParams, Patch, PatchParams, PostParams};
+use tracing::{info, warn};
 
-const KUBERNETES_SERVICE_NAME: &str = "kubernetes";
+const CONTROLLER_NAME: &str = "kubernetes-service-cidr-controller";
+const DEFAULT_SERVICE_CIDR_NAME: &str = "kubernetes";
 
-/// Controller is the controller manager for the core bootstrap Kubernetes
-/// controller loops, which manage creating the "kubernetes" service and
-/// provide the IP repair check on service IPs
-pub struct Controller {
-    config: Config,
+/// NewController 返回一个新的 *Controller，它从 `--service-cluster-ip-range` 标志生成默认的 ServiceCIDR
+/// 并在必要时重新创建它，但如果不同则不更新它。
+/// 它遵循与 kubernetes.default Service 相同的逻辑。
+pub fn new_controller(
+    primary_range: ipnetwork::IpNetwork,
+    secondary_range: Option<ipnetwork::IpNetwork>,
     client: Client,
-    service_lister: Store<Service>,
-    service_synced: bool,
-    lock: Mutex<()>,
-    stop_tx: Option<mpsc::Sender<()>>,
+) -> Controller {
+    let mut cidrs = vec![primary_range.to_string()];
+    if let Some(secondary) = secondary_range {
+        cidrs.push(secondary.to_string());
+    }
+
+    Controller {
+        cidrs,
+        client,
+        interval: Duration::from_secs(10), // 与 DefaultEndpointReconcilerInterval 相同
+        reported_mismatched_cidrs: Arc::new(RwLock::new(false)),
+        reported_not_ready_condition: Arc::new(RwLock::new(false)),
+    }
 }
 
-pub struct Config {
-    pub public_ip: IpAddr,
-    pub endpoint_reconciler: Box<dyn EndpointReconciler>,
-    pub endpoint_interval: Duration,
-    
-    /// ServiceIP indicates where the kubernetes service will live. It may not be nil.
-    pub service_ip: IpAddr,
-    pub service_port: i32,
-    pub public_service_port: i32,
-    pub kubernetes_service_node_port: i32,
-}
+/// Controller 管理基于选择器的服务 ipAddress。
+pub struct Controller {
+    cidrs: Vec<String>, // 顺序很重要，第一个 cidr 定义默认 IP 族
 
-pub trait EndpointReconciler: Send + Sync {
-    fn remove_endpoints(
-        &self,
-        service_name: &str,
-        ip: IpAddr,
-        ports: Vec<EndpointPort>,
-    ) -> Result<(), Box<dyn std::error::Error>>;
-    
-    fn reconcile_endpoints(
-        &self,
-        service_name: &str,
-        ip: IpAddr,
-        ports: Vec<EndpointPort>,
-        reconcile: bool,
-    ) -> Result<(), Box<dyn std::error::Error>>;
-    
-    fn stop_reconciling(&self);
-    fn destroy(&self);
+    client: Client,
+
+    interval: Duration,
+    reported_mismatched_cidrs: Arc<RwLock<bool>>,
+    reported_not_ready_condition: Arc<RwLock<bool>>,
 }
 
 impl Controller {
-    /// New returns a controller for watching the kubernetes service endpoints.
-    pub fn new(
-        config: Config,
-        client: Client,
-        service_lister: Store<Service>,
-    ) -> Self {
-        Controller {
-            config,
-            client,
-            service_lister,
-            service_synced: false,
-            lock: Mutex::new(()),
-            stop_tx: None,
-        }
-    }
+    /// Start 在默认 ServiceCIDR 存在或 stopCh 关闭之前不会返回。
+    pub async fn start(&self, ctx: tokio::context::Context) {
+        info!("Starting {}", CONTROLLER_NAME);
 
-    /// Start begins the core controller loops that must exist for bootstrapping
-    /// a cluster.
-    pub async fn start(&mut self, mut stop_rx: mpsc::Receiver<()>) {
-        if !self.wait_for_cache_sync(&mut stop_rx).await {
-            eprintln!("timed out waiting for caches to sync");
-            return;
-        }
+        let api: Api<networkingapiv1::ServiceCIDR> = Api::all(self.client.clone());
 
-        // Reconcile during first run removing itself until server is ready.
-        let endpoint_ports = create_endpoint_port_spec(self.config.public_service_port, "https");
-        match self.config.endpoint_reconciler.remove_endpoints(
-            KUBERNETES_SERVICE_NAME,
-            self.config.public_ip,
-            endpoint_ports.clone(),
-        ) {
-            Ok(_) => {
-                eprintln!("Found stale data, removed previous endpoints on kubernetes service, apiserver didn't exit successfully previously");
-            }
-            Err(e) if !is_not_found(&e) => {
-                eprintln!("Error removing old endpoints from kubernetes service: {:?}", e);
-            }
-            _ => {}
-        }
-
-        let (local_stop_tx, mut local_stop_rx) = mpsc::channel(1);
-        
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = stop_rx.recv() => {}, // from Start
-                _ = local_stop_rx.recv() => {}, // from Stop
-            }
-        });
-
-        self.run(local_stop_rx).await;
-    }
-
-    /// Stop cleans up this API Servers endpoint reconciliation leases so another master can take over more quickly.
-    pub async fn stop(&mut self) {
-        let _guard = self.lock.lock().unwrap();
-
-        if let Some(stop_tx) = self.stop_tx.take() {
-            let _ = stop_tx.send(()).await;
-        } else {
-            return; // only close once
-        }
-
-        let endpoint_ports = create_endpoint_port_spec(self.config.public_service_port, "https");
-        let reconciler = &self.config.endpoint_reconciler;
-        let public_ip = self.config.public_ip;
-        let endpoint_interval = self.config.endpoint_interval;
-
-        let finished = tokio::spawn(async move {
-            println!("Shutting down kubernetes service endpoint reconciler");
-            reconciler.stop_reconciling();
-            if let Err(e) = reconciler.remove_endpoints(
-                KUBERNETES_SERVICE_NAME,
-                public_ip,
-                endpoint_ports,
-            ) {
-                eprintln!("Unable to remove endpoints from kubernetes service: {:?}", e);
-            }
-            reconciler.destroy();
-        });
-
-        match tokio::time::timeout(2 * endpoint_interval, finished).await {
-            Ok(_) => {
-                // done
-            }
-            Err(_) => {
-                // don't block server shutdown forever if we can't reach etcd to remove ourselves
-                eprintln!("RemoveEndpoints() timed out");
-            }
-        }
-    }
-
-    /// Run periodically updates the kubernetes service
-    pub async fn run(&self, mut stop_rx: mpsc::Receiver<()>) {
-        // wait until process is ready
-        let ready = self.wait_for_ready(&mut stop_rx).await;
-        if !ready {
-            return;
-        }
-
-        let mut interval = time::interval(self.config.endpoint_interval);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // Service definition is not reconciled after first
-                    // run, ports and type will be corrected only during
-                    // start.
-                    if let Err(e) = self.update_kubernetes_service(false).await {
-                        eprintln!("unable to sync kubernetes service: {:?}", e);
-                    }
-                }
-                _ = stop_rx.recv() => {
-                    break;
-                }
-            }
-        }
-    }
-
-    /// UpdateKubernetesService attempts to update the default Kube service.
-    pub async fn update_kubernetes_service(&self, reconcile: bool) -> Result<(), Box<dyn std::error::Error>> {
-        // Update service & endpoint records.
-        let (service_ports, service_type) = create_port_and_service_spec(
-            self.config.service_port,
-            self.config.public_service_port,
-            self.config.kubernetes_service_node_port,
-            "https",
-        );
-        
-        self.create_or_update_master_service_if_needed(
-            KUBERNETES_SERVICE_NAME,
-            self.config.service_ip,
-            service_ports,
-            service_type.clone(),
-            reconcile,
-        ).await?;
-        
-        let endpoint_ports = create_endpoint_port_spec(self.config.public_service_port, "https");
-        self.config.endpoint_reconciler.reconcile_endpoints(
-            KUBERNETES_SERVICE_NAME,
-            self.config.public_ip,
-            endpoint_ports,
-            reconcile,
-        )?;
-        
-        Ok(())
-    }
-
-    /// CreateOrUpdateMasterServiceIfNeeded will create the specified service if it
-    /// doesn't already exist.
-    async fn create_or_update_master_service_if_needed(
-        &self,
-        service_name: &str,
-        service_ip: IpAddr,
-        service_ports: Vec<ServicePort>,
-        service_type: String,
-        reconcile: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let services: Api<Service> = Api::default_namespaced(self.client.clone());
-        
-        if let Some(s) = self.service_lister.get(&ObjectRef::new(service_name).within("default")) {
-            // The service already exists.
-            // This path is no executed since 1.17 2a9a9fa, keeping it in case it needs to be revisited
-            if reconcile {
-                if let Some((svc, true)) = get_master_service_update_if_needed(
-                    s,
-                    service_ports.clone(),
-                    service_type.clone(),
-                ) {
-                    eprintln!("Resetting master service {:?} to {:?}", service_name, svc);
-                    services.replace(service_name, &Default::default(), &svc).await?;
-                }
-            }
-            return Ok(());
-        }
-
-        let single_stack = "SingleStack".to_string();
-        let mut labels = std::collections::BTreeMap::new();
-        labels.insert("provider".to_string(), "kubernetes".to_string());
-        labels.insert("component".to_string(), "apiserver".to_string());
-
-        let svc = Service {
-            metadata: ObjectMeta {
-                name: Some(service_name.to_string()),
-                namespace: Some("default".to_string()),
-                labels: Some(labels),
-                ..Default::default()
-            },
-            spec: Some(ServiceSpec {
-                ports: Some(service_ports.clone()),
-                // maintained by this code, not by the pod selector
-                selector: None,
-                cluster_ip: Some(service_ip.to_string()),
-                ip_family_policy: Some(single_stack),
-                session_affinity: Some("None".to_string()),
-                type_: Some(service_type.clone()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        match services.create(&Default::default(), &svc).await {
-            Ok(_) => Ok(()),
-            Err(KubeError::Api(api_err)) if api_err.code == 409 => {
-                // AlreadyExists
-                self.create_or_update_master_service_if_needed(
-                    service_name,
-                    service_ip,
-                    service_ports,
-                    service_type,
-                    reconcile,
-                ).await
-            }
-            Err(e) => Err(Box::new(e)),
-        }
-    }
-
-    async fn wait_for_cache_sync(&self, stop_rx: &mut mpsc::Receiver<()>) -> bool {
-        // Simplified implementation - in real code would wait for informer sync
-        true
-    }
-
-    async fn wait_for_ready(&self, stop_rx: &mut mpsc::Receiver<()>) -> bool {
+        // 等待直到第一次成功同步
+        // 这会阻塞 apiserver 启动，所以使用短间隔轮询
         let mut interval = time::interval(Duration::from_millis(100));
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    // Check readiness endpoint
-                    // Simplified - in real code would check /readyz
-                    return true;
+                _ = ctx.done() => {
+                    info!("Shutting down {}", CONTROLLER_NAME);
+                    return;
                 }
-                _ = stop_rx.recv() => {
-                    return false;
+                _ = interval.tick() => {
+                    match self.sync().await {
+                        Ok(_) => break,
+                        Err(e) => {
+                            info!("error initializing the default ServiceCIDR: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 在后台以定义的间隔运行同步循环
+        let mut sync_interval = time::interval(self.interval);
+        loop {
+            tokio::select! {
+                _ = ctx.done() => {
+                    info!("Shutting down {}", CONTROLLER_NAME);
+                    return;
+                }
+                _ = sync_interval.tick() => {
+                    if let Err(e) = self.sync().await {
+                        info!("error trying to sync the default ServiceCIDR: {:?}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn sync(&self) -> Result<(), kube::Error> {
+        let api: Api<networkingapiv1::ServiceCIDR> = Api::all(self.client.clone());
+
+        // 检查默认 ServiceCIDR 是否已存在
+        match api.get(DEFAULT_SERVICE_CIDR_NAME).await {
+            Ok(service_cidr) => {
+                // 单栈到双栈升级
+                if self.cidrs.len() == 2
+                    && service_cidr.spec.as_ref().map(|s| s.cidrs.as_ref().map(|c| c.len()).unwrap_or(0)).unwrap_or(0) == 1
+                    && service_cidr.spec.as_ref().and_then(|s| s.cidrs.as_ref()).map(|c| &c[0]) == Some(&self.cidrs[0])
+                {
+                    info!(
+                        "Updating default ServiceCIDR from single-stack ({:?}) to dual-stack ({:?})",
+                        service_cidr.spec.as_ref().and_then(|s| s.cidrs.as_ref()),
+                        self.cidrs
+                    );
+                    let mut updated = service_cidr.clone();
+                    if let Some(spec) = updated.spec.as_mut() {
+                        spec.cidrs = Some(self.cidrs.clone());
+                    }
+                    
+                    match api.replace(DEFAULT_SERVICE_CIDR_NAME, &PostParams::default(), &updated).await {
+                        Err(e) => {
+                            info!(
+                                "The default ServiceCIDR can not be updated from {} to dual stack {:?} : {:?}",
+                                self.cidrs[0], self.cidrs, e
+                            );
+                            // 事件记录器调用
+                        }
+                        Ok(_) => {}
+                    }
+                } else {
+                    self.sync_status(&service_cidr).await;
+                }
+                Ok(())
+            }
+            Err(kube::Error::Api(err)) if err.code == 404 => {
+                // 默认 ServiceCIDR 不存在
+                info!("Creating default ServiceCIDR with CIDRs: {:?}", self.cidrs);
+                let service_cidr = networkingapiv1::ServiceCIDR {
+                    metadata: metav1::ObjectMeta {
+                        name: Some(DEFAULT_SERVICE_CIDR_NAME.to_string()),
+                        ..Default::default()
+                    },
+                    spec: Some(networkingapiv1::ServiceCIDRSpec {
+                        cidrs: Some(self.cidrs.clone()),
+                    }),
+                    status: None,
+                };
+
+                match api.create(&PostParams::default(), &service_cidr).await {
+                    Ok(created) => {
+                        self.sync_status(&created).await;
+                        Ok(())
+                    }
+                    Err(kube::Error::Api(err)) if err.code == 409 => {
+                        // AlreadyExists
+                        Ok(())
+                    }
+                    Err(e) => {
+                        // 事件记录器调用
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn sync_status(&self, service_cidr: &networkingapiv1::ServiceCIDR) {
+        // 如果 ServiceCIDR 正在被删除，则不同步其状态，
+        // 删除必须由 controller-manager 处理
+        if service_cidr.metadata.deletion_timestamp.is_some() {
+            tracing::debug!("ServiceCIDR {} is being deleted, skipping status sync", service_cidr.name_any());
+            return;
+        }
+
+        // 如果 Ready 条件不存在且 CIDR 值与此控制器的 CIDR 值匹配，
+        // 此控制器将把 Ready 条件设置为 true。
+        let spec_cidrs = service_cidr.spec.as_ref().and_then(|s| s.cidrs.as_ref());
+        let same_config = spec_cidrs.map(|c| c == &self.cidrs).unwrap_or(false);
+        let current_ready_condition = service_cidr
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|conditions| {
+                conditions.iter().find(|c| c.type_ == networkingapiv1::SERVICE_CIDR_CONDITION_READY)
+            });
+
+        // 处理不一致的配置
+        if !same_config {
+            let mut reported = self.reported_mismatched_cidrs.write().await;
+            if !*reported {
+                info!(
+                    "Inconsistent ServiceCIDR status for {}, controller configuration: {:?}, ServiceCIDR configuration: {:?}. Configure the flags to match current ServiceCIDR or manually delete it.",
+                    service_cidr.name_any(),
+                    self.cidrs,
+                    spec_cidrs
+                );
+                // 事件记录器调用
+                *reported = true;
+            }
+            // 无论当前的 Ready 条件如何，不一致的配置都是一个问题。
+            // 在这种情况下，我们不尝试更改 Ready 状态。
+            return;
+        }
+
+        // 配置一致 (sameConfig)
+        match current_ready_condition {
+            // 当前 Ready=False，不应该发生的状态。
+            // 不要尝试覆盖由其他组件设置的 Ready=False 以避免热循环。
+            // 默认 ServiceCIDR 永远不应该将此条件设置为 False，如果是这种情况，
+            // 那么需要集群管理员的干预。
+            Some(condition) if condition.status == "False" => {
+                let mut reported = self.reported_not_ready_condition.write().await;
+                if !*reported {
+                    info!(
+                        "Default ServiceCIDR condition Ready is False, but controller configuration matches. Please validate your cluster's network configuration. serviceCIDR: {}, status: {}, reason: {}, message: {}",
+                        service_cidr.name_any(),
+                        condition.status,
+                        condition.reason.as_deref().unwrap_or(""),
+                        condition.message.as_deref().unwrap_or("")
+                    );
+                    // 事件记录器调用
+                    *reported = true;
+                }
+            }
+
+            // 当前 Ready=True 且配置匹配，无需操作。
+            Some(condition) if condition.status == "True" => {
+                tracing::debug!(
+                    "ServiceCIDR {} is Ready and configuration matches. No status update needed.",
+                    service_cidr.name_any()
+                );
+            }
+
+            // 未设置条件且 ServiceCIDR 与此 apiserver 配置匹配，将条件设置为 True
+            None | Some(_) => {
+                info!("Setting default ServiceCIDR condition Ready to True");
+                
+                let now = metav1::Time(chrono::Utc::now());
+                let condition = metav1::Condition {
+                    type_: networkingapiv1::SERVICE_CIDR_CONDITION_READY.to_string(),
+                    status: "True".to_string(),
+                    observed_generation: service_cidr.metadata.generation,
+                    last_transition_time: now,
+                    reason: "Ready".to_string(),
+                    message: "Kubernetes default Service CIDR is ready".to_string(),
+                };
+
+                let mut status = service_cidr.status.clone().unwrap_or_default();
+                let mut conditions = status.conditions.unwrap_or_default();
+                
+                // 更新或添加条件
+                if let Some(pos) = conditions.iter().position(|c| c.type_ == networkingapiv1::SERVICE_CIDR_CONDITION_READY) {
+                    conditions[pos] = condition;
+                } else {
+                    conditions.push(condition);
+                }
+                status.conditions = Some(conditions);
+
+                let api: Api<networkingapiv1::ServiceCIDR> = Api::all(self.client.clone());
+                let patch = serde_json::json!({
+                    "status": status
+                });
+
+                match api
+                    .patch_status(
+                        DEFAULT_SERVICE_CIDR_NAME,
+                        &PatchParams::apply(CONTROLLER_NAME).force(),
+                        &Patch::Apply(&patch),
+                    )
+                    .await
+                {
+                    Err(e) => {
+                        info!("error updating default ServiceCIDR status: {:?}", e);
+                        // 事件记录器调用
+                    }
+                    Ok(_) => {}
                 }
             }
         }
     }
 }
 
-/// createPortAndServiceSpec creates an array of service ports.
-/// If the NodePort value is 0, just the servicePort is used, otherwise, a node port is exposed.
-fn create_port_and_service_spec(
-    service_port: i32,
-    target_service_port: i32,
-    node_port: i32,
-    service_port_name: &str,
-) -> (Vec<ServicePort>, String) {
-    // Use the Cluster IP type for the service port if NodePort isn't provided.
-    // Otherwise, we will be binding the master service to a NodePort.
-    let mut service_ports = vec![ServicePort {
-        protocol: Some("TCP".to_string()),
-        port: service_port,
-        name: Some(service_port_name.to_string()),
-        target_port: Some(IntOrString::Int(target_service_port)),
-        ..Default::default()
-    }];
+===============================================
+
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::time::{sleep, Instant};
+use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
+use k8s_openapi::api::coordination::v1beta1::LeaseCandidate;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta, Time};
+use kube::{
+    api::{Api, ListParams, Patch, PatchParams, PostParams},
+    client::Client,
+    runtime::{
+        controller::{Action, Controller as KubeController},
+        events::{Event, EventType, Recorder, Reporter},
+        finalizer::{finalizer, Event as FinalizerEvent},
+        watcher::Config,
+        Controller as RuntimeController,
+    },
+    Resource, ResourceExt,
+};
+use semver::Version;
+use thiserror::Error;
+use tracing::{error, info, warn};
+
+const CONTROLLER_NAME: &str = "leader-election-controller";
+
+// Requeue interval is the interval at which a Lease is requeued to verify that it is
+// being renewed properly.
+const DEFAULT_REQUEUE_INTERVAL: Duration = Duration::from_secs(5);
+const NO_REQUEUE: Duration = Duration::from_secs(0);
+
+const DEFAULT_LEASE_DURATION_SECONDS: i32 = 5;
+
+const ELECTION_DURATION: Duration = Duration::from_secs(5);
+
+const LEASE_CANDIDATE_VALID_DURATION: Duration = Duration::from_secs(30 * 60); // 30 minutes
+
+#[derive(Error, Debug)]
+pub enum ControllerError {
+    #[error("Kubernetes error: {0}")]
+    KubeError(#[from] kube::Error),
     
-    let mut service_type = "ClusterIP".to_string();
-    if node_port > 0 {
-        service_ports[0].node_port = Some(node_port);
-        service_type = "NodePort".to_string();
-    }
+    #[error("No candidates available")]
+    NoCandidates,
     
-    (service_ports, service_type)
+    #[error("No available candidates")]
+    NoAvailableCandidates,
+    
+    #[error("Could not find suitable electee")]
+    NoSuitableElectee,
+    
+    #[error("Candidates at same binary version but received differing strategies: {0}, {1}")]
+    ConflictingStrategies(String, String),
+    
+    #[error("Semver parse error: {0}")]
+    SemverError(#[from] semver::Error),
+    
+    #[error("Error reading lease: {0}")]
+    LeaseReadError(String),
 }
 
-/// createEndpointPortSpec creates the endpoint ports
-fn create_endpoint_port_spec(endpoint_port: i32, endpoint_port_name: &str) -> Vec<EndpointPort> {
-    vec![EndpointPort {
-        protocol: Some("TCP".to_string()),
-        port: endpoint_port,
-        name: Some(endpoint_port_name.to_string()),
-        ..Default::default()
-    }]
+/// Controller is the leader election controller, which observes component identity leases for
+/// components that have self-nominated as candidate leaders for leases and elects leaders
+/// for those leases, favoring candidates with higher versions.
+pub struct Controller {
+    lease_api: Api<Lease>,
+    lease_candidate_api: Api<LeaseCandidate>,
+    client: Client,
 }
 
-/// getMasterServiceUpdateIfNeeded sets service attributes for the given apiserver service.
-fn get_master_service_update_if_needed(
-    svc: &Service,
-    service_ports: Vec<ServicePort>,
-    service_type: String,
-) -> Option<(Service, bool)> {
-    // Determine if the service is in the format we expect
-    // (servicePorts are present and service type matches)
-    let format_correct = check_service_format(svc, &service_ports, &service_type);
-    if format_correct {
-        return Some((svc.clone(), false));
+impl Controller {
+    pub fn new(client: Client, namespace: &str) -> Self {
+        Self {
+            lease_api: Api::namespaced(client.clone(), namespace),
+            lease_candidate_api: Api::namespaced(client.clone(), namespace),
+            client,
+        }
     }
-    
-    let mut updated_svc = svc.clone();
-    if let Some(ref mut spec) = updated_svc.spec {
-        spec.ports = Some(service_ports);
-        spec.type_ = Some(service_type);
+
+    pub async fn run(self, workers: usize) -> Result<(), ControllerError> {
+        info!("Workers: {}", workers);
+        
+        // Start workers
+        let mut handles = vec![];
+        for i in 0..workers {
+            info!("Starting worker {}", i);
+            let controller = self.clone();
+            let handle = tokio::spawn(async move {
+                controller.run_election_worker().await;
+            });
+            handles.push(handle);
+        }
+        
+        // Wait for all workers
+        for handle in handles {
+            let _ = handle.await;
+        }
+        
+        Ok(())
     }
-    
-    Some((updated_svc, true))
+
+    async fn run_election_worker(&self) {
+        loop {
+            if !self.process_next_election_item().await {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn process_next_election_item(&self) -> bool {
+        // In a real implementation, this would get items from a work queue
+        // For now, we'll just sleep
+        sleep(Duration::from_secs(1)).await;
+        true
+    }
+
+    fn enqueue_candidate(&self, lc: &LeaseCandidate) {
+        // Ignore candidates that transitioned to Pending because reelection is already in progress
+        if let (Some(ping_time), Some(renew_time)) = (&lc.spec.ping_time, &lc.spec.renew_time) {
+            if renew_time.0 < ping_time.0 {
+                return;
+            }
+        }
+        // Add to queue (implementation depends on queue structure)
+    }
+
+    fn enqueue_lease(&self, lease: &Lease) {
+        // Add to queue (implementation depends on queue structure)
+    }
+
+    async fn election_needed(
+        &self,
+        candidates: &[LeaseCandidate],
+        lease_name: &str,
+        namespace: &str,
+    ) -> Result<bool, ControllerError> {
+        let lease_result = self.lease_api.get(lease_name).await;
+        
+        let lease = match lease_result {
+            Ok(l) => l,
+            Err(kube::Error::Api(err)) if err.code == 404 => {
+                return Ok(true);
+            }
+            Err(e) => {
+                return Err(ControllerError::LeaseReadError(e.to_string()));
+            }
+        };
+
+        if is_lease_expired(&lease) || lease.spec.as_ref()
+            .and_then(|s| s.holder_identity.as_ref())
+            .map_or(true, |h| h.is_empty())
+        {
+            return Ok(true);
+        }
+
+        // every 15min enforce an election to update all candidates. Every 30min we garbage collect.
+        let now = Instant::now();
+        for candidate in candidates {
+            if let Some(renew_time) = &candidate.spec.renew_time {
+                let renew_instant = time_to_instant(&renew_time.0);
+                if renew_instant + LEASE_CANDIDATE_VALID_DURATION / 2 < now {
+                    return Ok(true);
+                }
+            }
+        }
+
+        let prelim_strategy = pick_best_strategy(candidates)?;
+        if prelim_strategy != "OldestEmulationVersion" {
+            tracing::debug!("Strategy {:?} is ignored by CLE", prelim_strategy);
+            return Ok(false);
+        }
+
+        let prelim_electee = pick_best_leader_oldest_emulation_version(candidates);
+        if let Some(electee) = prelim_electee {
+            if let Some(spec) = &lease.spec {
+                if let Some(holder) = &spec.holder_identity {
+                    if electee.metadata.name.as_ref() == Some(holder) {
+                        tracing::debug!(
+                            "Leader {} is already most optimal for lease {}",
+                            holder,
+                            lease_name
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
+        } else {
+            return Ok(false);
+        }
+        
+        Ok(true)
+    }
+
+    /// reconcileElectionStep steps through a step in an election.
+    /// A step looks at the current state of Lease and LeaseCandidates and takes one of the following action
+    /// - do nothing (because leader is already optimal or still waiting for an event)
+    /// - request ack from candidates (update LeaseCandidate PingTime)
+    /// - finds the most optimal candidate and elect (update the Lease object)
+    /// Instead of keeping a map and lock on election, the state is
+    /// calculated every time by looking at the lease, and set of available candidates.
+    /// PingTime + electionDuration > time.Now: We just asked all candidates to ack and are still waiting for response
+    /// PingTime + electionDuration < time.Now: Candidate has not responded within the appropriate PingTime. Continue the election.
+    /// RenewTime + 5 seconds > time.Now: All candidates acked in the last 5 seconds, continue the election.
+    async fn reconcile_election_step(
+        &self,
+        lease_name: &str,
+        namespace: &str,
+    ) -> Result<Duration, ControllerError> {
+        let candidates = self.list_admissable_candidates(lease_name, namespace).await?;
+        
+        if candidates.is_empty() {
+            return Ok(NO_REQUEUE);
+        }
+        
+        tracing::trace!(
+            "Reconciling election for {}/{}, candidates: {}",
+            namespace,
+            lease_name,
+            candidates.len()
+        );
+
+        // Check if an election is really needed by looking at the current lease and candidates
+        let need_election = self.election_needed(&candidates, lease_name, namespace).await?;
+        if !need_election {
+            return Ok(DEFAULT_REQUEUE_INTERVAL);
+        }
+
+        let now = Instant::now();
+        let mut can_vote_yet = true;
+        
+        for candidate in &candidates {
+            if let (Some(ping_time), Some(renew_time)) = (&candidate.spec.ping_time, &candidate.spec.renew_time) {
+                let ping_instant = time_to_instant(&ping_time.0);
+                let renew_instant = time_to_instant(&renew_time.0);
+                
+                if ping_instant + ELECTION_DURATION > now && renew_instant < ping_instant {
+                    // continue waiting for the election to timeout
+                    can_vote_yet = false;
+                    continue;
+                }
+            }
+            
+            if let Some(renew_time) = &candidate.spec.renew_time {
+                let renew_instant = time_to_instant(&renew_time.0);
+                if renew_instant + ELECTION_DURATION > now {
+                    continue;
+                }
+            }
+
+            if candidate.spec.ping_time.is_none() ||
+                (candidate.spec.ping_time.as_ref().map(|pt| {
+                    let ping_instant = time_to_instant(&pt.0);
+                    ping_instant + ELECTION_DURATION < now &&
+                        candidate.spec.renew_time.as_ref().map_or(false, |rt| {
+                            time_to_instant(&rt.0) >= ping_instant
+                        })
+                }).unwrap_or(false))
+            {
+                let mut clone = candidate.clone();
+                clone.spec.ping_time = Some(MicroTime(chrono::Utc::now()));
+                
+                let patch = Patch::Merge(&clone);
+                self.lease_candidate_api
+                    .patch(&candidate.metadata.name.as_ref().unwrap(), &PatchParams::default(), &patch)
+                    .await?;
+                can_vote_yet = false;
+            }
+        }
+        
+        if !can_vote_yet {
+            return Ok(DEFAULT_REQUEUE_INTERVAL);
+        }
+
+        // election is ongoing as long as unexpired PingTimes exist
+        for candidate in &candidates {
+            if candidate.spec.ping_time.is_none() {
+                continue; // shouldn't be the case after the above
+            }
+
+            if let Some(renew_time) = &candidate.spec.renew_time {
+                if let Some(ping_time) = &candidate.spec.ping_time {
+                    if time_to_instant(&renew_time.0) >= time_to_instant(&ping_time.0) {
+                        continue; // this has renewed already
+                    }
+                }
+            }
+
+            // If a candidate has a PingTime within the election duration, they have not acked
+            // and we should wait until we receive their response
+            if let Some(ping_time) = &candidate.spec.ping_time {
+                if time_to_instant(&ping_time.0) + ELECTION_DURATION > now {
+                    // continue waiting for the election to timeout
+                    return Ok(NO_REQUEUE);
+                }
+            }
+        }
+
+        let mut acked_candidates = Vec::new();
+        for candidate in &candidates {
+            if let Some(renew_time) = &candidate.spec.renew_time {
+                if time_to_instant(&renew_time.0) + ELECTION_DURATION > now {
+                    acked_candidates.push(candidate.clone());
+                }
+            }
+        }
+        
+        if acked_candidates.is_empty() {
+            return Err(ControllerError::NoAvailableCandidates);
+        }
+
+        let strategy = pick_best_strategy(&acked_candidates)?;
+
+        let mut leader_lease = Lease {
+            metadata: ObjectMeta {
+                namespace: Some(namespace.to_string()),
+                name: Some(lease_name.to_string()),
+                ..Default::default()
+            },
+            spec: Some(LeaseSpec {
+                strategy: Some(strategy.clone()),
+                lease_duration_seconds: Some(DEFAULT_LEASE_DURATION_SECONDS),
+                renew_time: Some(MicroTime(chrono::Utc::now())),
+                ..Default::default()
+            }),
+        };
+
+        match strategy.as_str() {
+            "OldestEmulationVersion" => {
+                let electee = pick_best_leader_oldest_emulation_version(&acked_candidates)
+                    .ok_or(ControllerError::NoSuitableElectee)?;
+                if let Some(spec) = &mut leader_lease.spec {
+                    spec.holder_identity = electee.metadata.name.clone();
+                }
+            }
+            _ => {
+                // do not set the holder identity, but leave it to some other controller. But fall
+                // through to create the lease (without holder).
+                tracing::debug!(
+                    "Election for strategy {:?} is not handled by {}",
+                    strategy,
+                    CONTROLLER_NAME
+                );
+            }
+        }
+
+        // create the leader election lease
+        match self.lease_api.create(&PostParams::default(), &leader_lease).await {
+            Ok(_) => {
+                if let Some(spec) = &leader_lease.spec {
+                    if let Some(holder) = &spec.holder_identity {
+                        info!("Created lease {}/{} for {:?}", namespace, lease_name, holder);
+                    } else {
+                        info!("Created lease {}/{} without leader", namespace, lease_name);
+                    }
+                }
+                return Ok(DEFAULT_REQUEUE_INTERVAL);
+            }
+            Err(kube::Error::Api(err)) if err.code == 409 => {
+                // Already exists, continue to update
+            }
+            Err(e) => {
+                return Err(ControllerError::KubeError(e));
+            }
+        }
+
+        // Get existing lease
+        let existing = self.lease_api.get(lease_name).await?;
+        let orig = existing.clone();
+
+        let mut updated = existing.clone();
+        let is_expired = is_lease_expired(&existing);
+        
+        let no_holder_identity = leader_lease.spec.as_ref()
+            .and_then(|s| s.holder_identity.as_ref())
+            .is_some() && existing.spec.as_ref()
+            .and_then(|s| s.holder_identity.as_ref())
+            .map_or(true, |h| h.is_empty());
+            
+        let expired_and_new_holder = is_expired && 
+            leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref()).is_some() &&
+            existing.spec.as_ref().and_then(|s| s.holder_identity.as_ref()) != 
+            leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
+            
+        let strategy_changed = existing.spec.as_ref()
+            .and_then(|s| s.strategy.as_ref())
+            .map_or(true, |s| s != &strategy);
+            
+        let different_holder = leader_lease.spec.as_ref()
+            .and_then(|s| s.holder_identity.as_ref())
+            .is_some() && 
+            leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref()) !=
+            existing.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
+
+        // Update lease
+        if strategy_changed {
+            info!("Lease {}/{} strategy changed to {:?}", namespace, lease_name, strategy);
+            if let Some(spec) = &mut updated.spec {
+                spec.strategy = Some(strategy.clone());
+            }
+        }
+        
+        if no_holder_identity || expired_and_new_holder {
+            if let Some(spec) = &mut updated.spec {
+                if no_holder_identity {
+                    info!(
+                        "Lease {}/{} had no holder, setting holder to {:?}",
+                        namespace,
+                        lease_name,
+                        leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref())
+                    );
+                } else {
+                    info!(
+                        "Lease {}/{} expired, resetting it and setting holder to {:?}",
+                        namespace,
+                        lease_name,
+                        leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref())
+                    );
+                }
+
+                spec.preferred_holder = None;
+                spec.holder_identity = leader_lease.spec.as_ref()
+                    .and_then(|s| s.holder_identity.clone());
+                spec.renew_time = Some(MicroTime(chrono::Utc::now()));
+                spec.lease_duration_seconds = Some(DEFAULT_LEASE_DURATION_SECONDS);
+                spec.acquire_time = None;
+            }
+        } else if different_holder {
+            if let Some(spec) = &mut updated.spec {
+                info!(
+                    "Lease {}/{} holder changed from {:?} to {:?}",
+                    namespace,
+                    lease_name,
+                    spec.holder_identity,
+                    leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref())
+                );
+                spec.preferred_holder = leader_lease.spec.as_ref()
+                    .and_then(|s| s.holder_identity.clone());
+            }
+        }
+
+        if updated == orig {
+            if let Some(spec) = &existing.spec {
+                if let Some(holder) = &spec.holder_identity {
+                    tracing::debug!(
+                        "Lease {} is managed by a third party strategy",
+                        holder
+                    );
+                } else {
+                    tracing::debug!(
+                        "Lease {}/{} already has the most optimal leader",
+                        namespace,
+                        lease_name
+                    );
+                }
+            }
+            // We need to requeue to ensure that we are aware of an expired lease
+            return Ok(DEFAULT_REQUEUE_INTERVAL);
+        }
+
+        self.lease_api
+            .replace(lease_name, &PostParams::default(), &updated)
+            .await?;
+
+        Ok(DEFAULT_REQUEUE_INTERVAL)
+    }
+
+    async fn list_admissable_candidates(
+        &self,
+        lease_name: &str,
+        namespace: &str,
+    ) -> Result<Vec<LeaseCandidate>, ControllerError> {
+        let leases = self.lease_candidate_api.list(&ListParams::default()).await?;
+        
+        let mut results = Vec::new();
+        for l in leases.items {
+            if l.spec.lease_name != lease_name {
+                continue;
+            }
+            if !is_lease_candidate_expired(&l) {
+                results.push(l);
+            } else {
+                info!("LeaseCandidate {} is expired", l.metadata.name.as_ref().unwrap_or(&"unknown".to_string()));
+            }
+        }
+        
+        Ok(results)
+    }
 }
 
-/// Determine if the service is in the correct format
-/// getMasterServiceUpdateIfNeeded expects (servicePorts are correct
-/// and service type matches).
-fn check_service_format(
-    s: &Service,
-    ports: &[ServicePort],
-    service_type: &str,
-) -> bool {
-    let spec = match &s.spec {
-        Some(spec) => spec,
-        None => return false,
-    };
-    
-    if spec.type_.as_deref() != Some(service_type) {
-        return false;
+impl Clone for Controller {
+    fn clone(&self) -> Self {
+        Self {
+            lease_api: self.lease_api.clone(),
+            lease_candidate_api: self.lease_candidate_api.clone(),
+            client: self.client.clone(),
+        }
     }
+}
+
+fn pick_best_leader_oldest_emulation_version(candidates: &[LeaseCandidate]) -> Option<LeaseCandidate> {
+    let mut electee: Option<LeaseCandidate> = None;
     
-    let s_ports = match &spec.ports {
-        Some(p) => p,
-        None => return false,
-    };
-    
-    if ports.len() != s_ports.len() {
-        return false;
-    }
-    
-    for (i, port) in ports.iter().enumerate() {
-        if port != &s_ports[i] {
-            return false;
+    for c in candidates {
+        if !valid_lease_candidate_for_oldest_emulation_version(c) {
+            continue;
+        }
+        if electee.is_none() || compare(electee.as_ref().unwrap(), c) > 0 {
+            electee = Some(c.clone());
         }
     }
     
-    true
+    electee
 }
 
-fn is_not_found(err: &Box<dyn std::error::Error>) -> bool {
-    // Simplified - in real code would check for specific NotFound error
-    err.to_string().contains("not found")
+fn pick_best_strategy(candidates: &[LeaseCandidate]) -> Result<String, ControllerError> {
+    if candidates.is_empty() {
+        return Err(ControllerError::NoCandidates);
+    }
+    
+    let candidate_name = candidates[0].metadata.name.as_ref().unwrap();
+    let mut strategy = candidates[0].spec.strategy.clone();
+    let mut highest_bv = get_binary_version_or_zero(&candidates[0]);
+
+    for c in &candidates[1..] {
+        let bin_version = get_binary_version_or_zero(c);
+        let result = highest_bv.cmp(&bin_version);
+        
+        match result {
+            std::cmp::Ordering::Less => {
+                strategy = c.spec.strategy.clone();
+                highest_bv = bin_version;
+            }
+            std::cmp::Ordering::Equal => {
+                if c.spec.strategy != strategy {
+                    return Err(ControllerError::ConflictingStrategies(
+                        strategy,
+                        c.spec.strategy.clone(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    Ok(strategy)
 }
+
+fn valid_lease_candidate_for_oldest_emulation_version(l: &LeaseCandidate) -> bool {
+    Version::parse(&l.spec.emulation_version).is_ok() &&
+        Version::parse(&l.spec.binary_version).is_ok()
+}
+
+fn get_emulation_version_or_zero(l: &LeaseCandidate) -> Version {
+    Version::parse(&l.spec.emulation_version).unwrap_or(Version::new(0, 0, 0))
+}
+
+fn get_binary_version_or_zero(l: &LeaseCandidate) -> Version {
+    Version::parse(&l.spec.binary_version).unwrap_or(Version::new(0, 0, 0))
+}
+
+/// -1: lhs better, 1: rhs better
+fn compare(lhs: &LeaseCandidate, rhs: &LeaseCandidate) -> i32 {
+    let l = get_emulation_version_or_zero(lhs);
+    let r = get_emulation_version_or_zero(rhs);
+    
+    match l.cmp(&r) {
+        std::cmp::Ordering::Equal => {
+            let l = get_binary_version_or_zero(lhs);
+            let r = get_binary_version_or_zero(rhs);
+            
+            match l.cmp(&r) {
+                std::cmp::Ordering::Equal => {
+                    if lhs.metadata.creation_timestamp > rhs.metadata.creation_timestamp {
+                        1
+                    } else {
+                        -1
+                    }
+                }
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Greater => 1,
+            }
+        }
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+fn is_lease_expired(lease: &Lease) -> bool {
+    let now = chrono::Utc::now();
+    
+    lease.spec.as_ref().map_or(true, |spec| {
+        spec.renew_time.is_none() ||
+            spec.lease_duration_seconds.is_none() ||
+            spec.renew_time.as_ref().map_or(true, |rt| {
+                let duration = Duration::from_secs(spec.lease_duration_seconds.unwrap() as u64);
+                rt.0 + chrono::Duration::from_std(duration).unwrap() < now
+            })
+    })
+}
+
+fn is_lease_candidate_expired(lease: &LeaseCandidate) -> bool {
+    let now = chrono::Utc::now();
+    
+    lease.spec.renew_time.is_none() ||
+        lease.spec.renew_time.as_ref().map_or(true, |rt| {
+            rt.0 + chrono::Duration::from_std(LEASE_CANDIDATE_VALID_DURATION).unwrap() < now
+        })
+}
+
+fn time_to_instant(time: &chrono::DateTime<chrono::Utc>) -> Instant {
+    // This is a simplified conversion - in production you'd need proper time handling
+    let now = chrono::Utc::now();
+    let diff = time.signed_duration_since(now);
+    
+    if diff.num_milliseconds() > 0 {
+        Instant::now() + Duration::from_millis(diff.num_milliseconds() as u64)
+    } else {
+        Instant::now() - Duration::from_millis((-diff.num_milliseconds()) as u64)
+    }
+}
+
