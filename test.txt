@@ -1,903 +1,1173 @@
+以下是将Go代码翻译成Rust的版本，保留英文注释：
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
-use tokio::time;
-use k8s_openapi::api::core::v1 as v1;
-use k8s_openapi::api::networking::v1 as networkingapiv1;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1 as metav1;
-use kube::{
-    Api, Client, ResourceExt,
-    runtime::{controller::Action, watcher, Controller as KubeController, reflector},
-};
-use kube::api::{ListParams, Patch, PatchParams, PostParams};
-use tracing::{info, warn};
+use std::sync::Mutex;
 
-const CONTROLLER_NAME: &str = "kubernetes-service-cidr-controller";
-const DEFAULT_SERVICE_CIDR_NAME: &str = "kubernetes";
-
-/// NewController 返回一个新的 *Controller，它从 `--service-cluster-ip-range` 标志生成默认的 ServiceCIDR
-/// 并在必要时重新创建它，但如果不同则不更新它。
-/// 它遵循与 kubernetes.default Service 相同的逻辑。
-pub fn new_controller(
-    primary_range: ipnetwork::IpNetwork,
-    secondary_range: Option<ipnetwork::IpNetwork>,
-    client: Client,
-) -> Controller {
-    let mut cidrs = vec![primary_range.to_string()];
-    if let Some(secondary) = secondary_range {
-        cidrs.push(secondary.to_string());
-    }
-
-    Controller {
-        cidrs,
-        client,
-        interval: Duration::from_secs(10), // 与 DefaultEndpointReconcilerInterval 相同
-        reported_mismatched_cidrs: Arc::new(RwLock::new(false)),
-        reported_not_ready_condition: Arc::new(RwLock::new(false)),
-    }
+// EndpointReconciler knows how to reconcile the endpoints for the apiserver service.
+trait EndpointReconciler {
+    // ReconcileEndpoints sets the endpoints for the given apiserver service (ro or rw).
+    // ReconcileEndpoints expects that the endpoints objects it manages will all be
+    // managed only by ReconcileEndpoints; therefore, to understand this, you need only
+    // understand the requirements.
+    //
+    // Requirements:
+    //  * All apiservers MUST use the same ports for their {rw, ro} services.
+    //  * All apiservers MUST use ReconcileEndpoints and only ReconcileEndpoints to manage the
+    //      endpoints for their {rw, ro} services.
+    //  * ReconcileEndpoints is called periodically from all apiservers.
+    fn reconcile_endpoints(
+        &self,
+        service_name: String,
+        ip: IpAddr,
+        endpoint_ports: Vec<EndpointPort>,
+        reconcile_ports: bool,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    
+    // RemoveEndpoints removes this apiserver's lease.
+    fn remove_endpoints(
+        &self,
+        service_name: String,
+        ip: IpAddr,
+        endpoint_ports: Vec<EndpointPort>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    
+    // StopReconciling turns any later ReconcileEndpoints call into a noop.
+    fn stop_reconciling(&self);
+    
+    // Destroy shuts down all internal structures.
+    // Destroy needs to be implemented in thread-safe way and be prepared for being
+    // called more than once.
+    fn destroy(&self);
 }
 
-/// Controller 管理基于选择器的服务 ipAddress。
-pub struct Controller {
-    cidrs: Vec<String>, // 顺序很重要，第一个 cidr 定义默认 IP 族
-
-    client: Client,
-
-    interval: Duration,
-    reported_mismatched_cidrs: Arc<RwLock<bool>>,
-    reported_not_ready_condition: Arc<RwLock<bool>>,
+// EndpointsAdapter provides a simple interface for reading and writing both
+// Endpoints and Endpoint Slices.
+// NOTE: This is an incomplete adapter implementation that is only suitable for
+// use in this package. This takes advantage of the Endpoints used in this
+// package always having a consistent set of ports, a single subset, and a small
+// set of addresses. Any more complex Endpoints resource would likely translate
+// into multiple Endpoint Slices creating significantly more complexity instead
+// of the 1:1 mapping this allows.
+struct EndpointsAdapter {
+    endpoint_client: Box<dyn EndpointsGetter>,
+    endpoint_slice_client: Box<dyn EndpointSlicesGetter>,
 }
 
-impl Controller {
-    /// Start 在默认 ServiceCIDR 存在或 stopCh 关闭之前不会返回。
-    pub async fn start(&self, ctx: tokio::context::Context) {
-        info!("Starting {}", CONTROLLER_NAME);
-
-        let api: Api<networkingapiv1::ServiceCIDR> = Api::all(self.client.clone());
-
-        // 等待直到第一次成功同步
-        // 这会阻塞 apiserver 启动，所以使用短间隔轮询
-        let mut interval = time::interval(Duration::from_millis(100));
-        loop {
-            tokio::select! {
-                _ = ctx.done() => {
-                    info!("Shutting down {}", CONTROLLER_NAME);
-                    return;
-                }
-                _ = interval.tick() => {
-                    match self.sync().await {
-                        Ok(_) => break,
-                        Err(e) => {
-                            info!("error initializing the default ServiceCIDR: {:?}", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 在后台以定义的间隔运行同步循环
-        let mut sync_interval = time::interval(self.interval);
-        loop {
-            tokio::select! {
-                _ = ctx.done() => {
-                    info!("Shutting down {}", CONTROLLER_NAME);
-                    return;
-                }
-                _ = sync_interval.tick() => {
-                    if let Err(e) = self.sync().await {
-                        info!("error trying to sync the default ServiceCIDR: {:?}", e);
-                    }
-                }
-            }
+impl EndpointsAdapter {
+    // NewEndpointsAdapter returns a new EndpointsAdapter.
+    fn new(
+        endpoint_client: Box<dyn EndpointsGetter>,
+        endpoint_slice_client: Box<dyn EndpointSlicesGetter>,
+    ) -> Self {
+        EndpointsAdapter {
+            endpoint_client,
+            endpoint_slice_client,
         }
     }
 
-    async fn sync(&self) -> Result<(), kube::Error> {
-        let api: Api<networkingapiv1::ServiceCIDR> = Api::all(self.client.clone());
+    // Get takes the name and namespace of the Endpoints resource, and returns a
+    // corresponding Endpoints object if it exists, and an error if there is any.
+    fn get(
+        &self,
+        namespace: &str,
+        name: &str,
+        get_opts: GetOptions,
+    ) -> Result<Endpoints, Box<dyn std::error::Error>> {
+        self.endpoint_client.endpoints(namespace).get(name, get_opts)
+    }
 
-        // 检查默认 ServiceCIDR 是否已存在
-        match api.get(DEFAULT_SERVICE_CIDR_NAME).await {
-            Ok(service_cidr) => {
-                // 单栈到双栈升级
-                if self.cidrs.len() == 2
-                    && service_cidr.spec.as_ref().map(|s| s.cidrs.as_ref().map(|c| c.len()).unwrap_or(0)).unwrap_or(0) == 1
-                    && service_cidr.spec.as_ref().and_then(|s| s.cidrs.as_ref()).map(|c| &c[0]) == Some(&self.cidrs[0])
-                {
-                    info!(
-                        "Updating default ServiceCIDR from single-stack ({:?}) to dual-stack ({:?})",
-                        service_cidr.spec.as_ref().and_then(|s| s.cidrs.as_ref()),
-                        self.cidrs
-                    );
-                    let mut updated = service_cidr.clone();
-                    if let Some(spec) = updated.spec.as_mut() {
-                        spec.cidrs = Some(self.cidrs.clone());
-                    }
+    // Create accepts a namespace and Endpoints object and creates the Endpoints
+    // object and matching EndpointSlice. The created Endpoints object or an error will be
+    // returned.
+    fn create(
+        &self,
+        namespace: &str,
+        endpoints: &Endpoints,
+    ) -> Result<Endpoints, Box<dyn std::error::Error>> {
+        let endpoints = self.endpoint_client
+            .endpoints(namespace)
+            .create(endpoints, CreateOptions::default())?;
+        
+        self.ensure_endpoint_slice_from_endpoints(namespace, &endpoints)?;
+        Ok(endpoints)
+    }
+
+    // Update accepts a namespace and Endpoints object and updates it and its
+    // matching EndpointSlice. The updated Endpoints object or an error will be returned.
+    fn update(
+        &self,
+        namespace: &str,
+        endpoints: &Endpoints,
+    ) -> Result<Endpoints, Box<dyn std::error::Error>> {
+        let endpoints = self.endpoint_client
+            .endpoints(namespace)
+            .update(endpoints, UpdateOptions::default())?;
+        
+        self.ensure_endpoint_slice_from_endpoints(namespace, &endpoints)?;
+        Ok(endpoints)
+    }
+
+    // EnsureEndpointSliceFromEndpoints accepts a namespace and Endpoints resource
+    // and creates or updates a corresponding EndpointSlice. An error will be returned
+    // if it fails to sync the EndpointSlice.
+    fn ensure_endpoint_slice_from_endpoints(
+        &self,
+        namespace: &str,
+        endpoints: &Endpoints,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let endpoint_slice = endpoint_slice_from_endpoints(endpoints);
+        
+        match self.endpoint_slice_client
+            .endpoint_slices(namespace)
+            .get(&endpoint_slice.name, GetOptions::default())
+        {
+            Ok(current_endpoint_slice) => {
+                // required for transition from IP to IPv4 address type.
+                if current_endpoint_slice.address_type != endpoint_slice.address_type {
+                    self.endpoint_slice_client
+                        .endpoint_slices(namespace)
+                        .delete(&endpoint_slice.name, DeleteOptions::default())?;
                     
-                    match api.replace(DEFAULT_SERVICE_CIDR_NAME, &PostParams::default(), &updated).await {
-                        Err(e) => {
-                            info!(
-                                "The default ServiceCIDR can not be updated from {} to dual stack {:?} : {:?}",
-                                self.cidrs[0], self.cidrs, e
-                            );
-                            // 事件记录器调用
-                        }
-                        Ok(_) => {}
-                    }
-                } else {
-                    self.sync_status(&service_cidr).await;
+                    self.endpoint_slice_client
+                        .endpoint_slices(namespace)
+                        .create(&endpoint_slice, CreateOptions::default())?;
+                    
+                    return Ok(());
                 }
-                Ok(())
-            }
-            Err(kube::Error::Api(err)) if err.code == 404 => {
-                // 默认 ServiceCIDR 不存在
-                info!("Creating default ServiceCIDR with CIDRs: {:?}", self.cidrs);
-                let service_cidr = networkingapiv1::ServiceCIDR {
-                    metadata: metav1::ObjectMeta {
-                        name: Some(DEFAULT_SERVICE_CIDR_NAME.to_string()),
-                        ..Default::default()
-                    },
-                    spec: Some(networkingapiv1::ServiceCIDRSpec {
-                        cidrs: Some(self.cidrs.clone()),
-                    }),
-                    status: None,
-                };
 
-                match api.create(&PostParams::default(), &service_cidr).await {
-                    Ok(created) => {
-                        self.sync_status(&created).await;
-                        Ok(())
-                    }
-                    Err(kube::Error::Api(err)) if err.code == 409 => {
-                        // AlreadyExists
-                        Ok(())
-                    }
-                    Err(e) => {
-                        // 事件记录器调用
-                        Err(e)
-                    }
-                }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn sync_status(&self, service_cidr: &networkingapiv1::ServiceCIDR) {
-        // 如果 ServiceCIDR 正在被删除，则不同步其状态，
-        // 删除必须由 controller-manager 处理
-        if service_cidr.metadata.deletion_timestamp.is_some() {
-            tracing::debug!("ServiceCIDR {} is being deleted, skipping status sync", service_cidr.name_any());
-            return;
-        }
-
-        // 如果 Ready 条件不存在且 CIDR 值与此控制器的 CIDR 值匹配，
-        // 此控制器将把 Ready 条件设置为 true。
-        let spec_cidrs = service_cidr.spec.as_ref().and_then(|s| s.cidrs.as_ref());
-        let same_config = spec_cidrs.map(|c| c == &self.cidrs).unwrap_or(false);
-        let current_ready_condition = service_cidr
-            .status
-            .as_ref()
-            .and_then(|s| s.conditions.as_ref())
-            .and_then(|conditions| {
-                conditions.iter().find(|c| c.type_ == networkingapiv1::SERVICE_CIDR_CONDITION_READY)
-            });
-
-        // 处理不一致的配置
-        if !same_config {
-            let mut reported = self.reported_mismatched_cidrs.write().await;
-            if !*reported {
-                info!(
-                    "Inconsistent ServiceCIDR status for {}, controller configuration: {:?}, ServiceCIDR configuration: {:?}. Configure the flags to match current ServiceCIDR or manually delete it.",
-                    service_cidr.name_any(),
-                    self.cidrs,
-                    spec_cidrs
-                );
-                // 事件记录器调用
-                *reported = true;
-            }
-            // 无论当前的 Ready 条件如何，不一致的配置都是一个问题。
-            // 在这种情况下，我们不尝试更改 Ready 状态。
-            return;
-        }
-
-        // 配置一致 (sameConfig)
-        match current_ready_condition {
-            // 当前 Ready=False，不应该发生的状态。
-            // 不要尝试覆盖由其他组件设置的 Ready=False 以避免热循环。
-            // 默认 ServiceCIDR 永远不应该将此条件设置为 False，如果是这种情况，
-            // 那么需要集群管理员的干预。
-            Some(condition) if condition.status == "False" => {
-                let mut reported = self.reported_not_ready_condition.write().await;
-                if !*reported {
-                    info!(
-                        "Default ServiceCIDR condition Ready is False, but controller configuration matches. Please validate your cluster's network configuration. serviceCIDR: {}, status: {}, reason: {}, message: {}",
-                        service_cidr.name_any(),
-                        condition.status,
-                        condition.reason.as_deref().unwrap_or(""),
-                        condition.message.as_deref().unwrap_or("")
-                    );
-                    // 事件记录器调用
-                    *reported = true;
-                }
-            }
-
-            // 当前 Ready=True 且配置匹配，无需操作。
-            Some(condition) if condition.status == "True" => {
-                tracing::debug!(
-                    "ServiceCIDR {} is Ready and configuration matches. No status update needed.",
-                    service_cidr.name_any()
-                );
-            }
-
-            // 未设置条件且 ServiceCIDR 与此 apiserver 配置匹配，将条件设置为 True
-            None | Some(_) => {
-                info!("Setting default ServiceCIDR condition Ready to True");
-                
-                let now = metav1::Time(chrono::Utc::now());
-                let condition = metav1::Condition {
-                    type_: networkingapiv1::SERVICE_CIDR_CONDITION_READY.to_string(),
-                    status: "True".to_string(),
-                    observed_generation: service_cidr.metadata.generation,
-                    last_transition_time: now,
-                    reason: "Ready".to_string(),
-                    message: "Kubernetes default Service CIDR is ready".to_string(),
-                };
-
-                let mut status = service_cidr.status.clone().unwrap_or_default();
-                let mut conditions = status.conditions.unwrap_or_default();
-                
-                // 更新或添加条件
-                if let Some(pos) = conditions.iter().position(|c| c.type_ == networkingapiv1::SERVICE_CIDR_CONDITION_READY) {
-                    conditions[pos] = condition;
-                } else {
-                    conditions.push(condition);
-                }
-                status.conditions = Some(conditions);
-
-                let api: Api<networkingapiv1::ServiceCIDR> = Api::all(self.client.clone());
-                let patch = serde_json::json!({
-                    "status": status
-                });
-
-                match api
-                    .patch_status(
-                        DEFAULT_SERVICE_CIDR_NAME,
-                        &PatchParams::apply(CONTROLLER_NAME).force(),
-                        &Patch::Apply(&patch),
-                    )
-                    .await
+                if semantic_deep_equal(&current_endpoint_slice.endpoints, &endpoint_slice.endpoints)
+                    && semantic_deep_equal(&current_endpoint_slice.ports, &endpoint_slice.ports)
+                    && semantic_deep_equal(&current_endpoint_slice.labels, &endpoint_slice.labels)
                 {
-                    Err(e) => {
-                        info!("error updating default ServiceCIDR status: {:?}", e);
-                        // 事件记录器调用
-                    }
+                    return Ok(());
+                }
+
+                self.endpoint_slice_client
+                    .endpoint_slices(namespace)
+                    .update(&endpoint_slice, UpdateOptions::default())?;
+            }
+            Err(e) if is_not_found(&e) => {
+                match self.endpoint_slice_client
+                    .endpoint_slices(namespace)
+                    .create(&endpoint_slice, CreateOptions::default())
+                {
                     Ok(_) => {}
+                    Err(e) if is_already_exists(&e) => {}
+                    Err(e) => return Err(e),
                 }
             }
-        }
-    }
-}
-
-===============================================
-
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
-use tokio::time::{sleep, Instant};
-use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
-use k8s_openapi::api::coordination::v1beta1::LeaseCandidate;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta, Time};
-use kube::{
-    api::{Api, ListParams, Patch, PatchParams, PostParams},
-    client::Client,
-    runtime::{
-        controller::{Action, Controller as KubeController},
-        events::{Event, EventType, Recorder, Reporter},
-        finalizer::{finalizer, Event as FinalizerEvent},
-        watcher::Config,
-        Controller as RuntimeController,
-    },
-    Resource, ResourceExt,
-};
-use semver::Version;
-use thiserror::Error;
-use tracing::{error, info, warn};
-
-const CONTROLLER_NAME: &str = "leader-election-controller";
-
-// Requeue interval is the interval at which a Lease is requeued to verify that it is
-// being renewed properly.
-const DEFAULT_REQUEUE_INTERVAL: Duration = Duration::from_secs(5);
-const NO_REQUEUE: Duration = Duration::from_secs(0);
-
-const DEFAULT_LEASE_DURATION_SECONDS: i32 = 5;
-
-const ELECTION_DURATION: Duration = Duration::from_secs(5);
-
-const LEASE_CANDIDATE_VALID_DURATION: Duration = Duration::from_secs(30 * 60); // 30 minutes
-
-#[derive(Error, Debug)]
-pub enum ControllerError {
-    #[error("Kubernetes error: {0}")]
-    KubeError(#[from] kube::Error),
-    
-    #[error("No candidates available")]
-    NoCandidates,
-    
-    #[error("No available candidates")]
-    NoAvailableCandidates,
-    
-    #[error("Could not find suitable electee")]
-    NoSuitableElectee,
-    
-    #[error("Candidates at same binary version but received differing strategies: {0}, {1}")]
-    ConflictingStrategies(String, String),
-    
-    #[error("Semver parse error: {0}")]
-    SemverError(#[from] semver::Error),
-    
-    #[error("Error reading lease: {0}")]
-    LeaseReadError(String),
-}
-
-/// Controller is the leader election controller, which observes component identity leases for
-/// components that have self-nominated as candidate leaders for leases and elects leaders
-/// for those leases, favoring candidates with higher versions.
-pub struct Controller {
-    lease_api: Api<Lease>,
-    lease_candidate_api: Api<LeaseCandidate>,
-    client: Client,
-}
-
-impl Controller {
-    pub fn new(client: Client, namespace: &str) -> Self {
-        Self {
-            lease_api: Api::namespaced(client.clone(), namespace),
-            lease_candidate_api: Api::namespaced(client.clone(), namespace),
-            client,
-        }
-    }
-
-    pub async fn run(self, workers: usize) -> Result<(), ControllerError> {
-        info!("Workers: {}", workers);
-        
-        // Start workers
-        let mut handles = vec![];
-        for i in 0..workers {
-            info!("Starting worker {}", i);
-            let controller = self.clone();
-            let handle = tokio::spawn(async move {
-                controller.run_election_worker().await;
-            });
-            handles.push(handle);
-        }
-        
-        // Wait for all workers
-        for handle in handles {
-            let _ = handle.await;
+            Err(e) => return Err(e),
         }
         
         Ok(())
     }
+}
 
-    async fn run_election_worker(&self) {
-        loop {
-            if !self.process_next_election_item().await {
-                break;
-            }
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
+// endpointSliceFromEndpoints generates an EndpointSlice from an Endpoints
+// resource.
+fn endpoint_slice_from_endpoints(endpoints: &Endpoints) -> EndpointSlice {
+    let mut endpoint_slice = EndpointSlice {
+        name: endpoints.name.clone(),
+        namespace: endpoints.namespace.clone(),
+        labels: std::collections::HashMap::new(),
+        address_type: AddressType::IPv4,
+        ports: Vec::new(),
+        endpoints: Vec::new(),
+    };
+    
+    endpoint_slice.labels.insert(
+        LABEL_SERVICE_NAME.to_string(),
+        endpoints.name.clone(),
+    );
 
-    async fn process_next_election_item(&self) -> bool {
-        // In a real implementation, this would get items from a work queue
-        // For now, we'll just sleep
-        sleep(Duration::from_secs(1)).await;
-        true
-    }
+    // TODO: Add support for dual stack here (and in the rest of
+    // EndpointsAdapter).
+    endpoint_slice.address_type = AddressType::IPv4;
 
-    fn enqueue_candidate(&self, lc: &LeaseCandidate) {
-        // Ignore candidates that transitioned to Pending because reelection is already in progress
-        if let (Some(ping_time), Some(renew_time)) = (&lc.spec.ping_time, &lc.spec.renew_time) {
-            if renew_time.0 < ping_time.0 {
-                return;
-            }
-        }
-        // Add to queue (implementation depends on queue structure)
-    }
-
-    fn enqueue_lease(&self, lease: &Lease) {
-        // Add to queue (implementation depends on queue structure)
-    }
-
-    async fn election_needed(
-        &self,
-        candidates: &[LeaseCandidate],
-        lease_name: &str,
-        namespace: &str,
-    ) -> Result<bool, ControllerError> {
-        let lease_result = self.lease_api.get(lease_name).await;
+    if !endpoints.subsets.is_empty() {
+        let subset = &endpoints.subsets[0];
         
-        let lease = match lease_result {
-            Ok(l) => l,
-            Err(kube::Error::Api(err)) if err.code == 404 => {
-                return Ok(true);
-            }
-            Err(e) => {
-                return Err(ControllerError::LeaseReadError(e.to_string()));
-            }
-        };
-
-        if is_lease_expired(&lease) || lease.spec.as_ref()
-            .and_then(|s| s.holder_identity.as_ref())
-            .map_or(true, |h| h.is_empty())
-        {
-            return Ok(true);
+        for port in &subset.ports {
+            endpoint_slice.ports.push(EndpointPort {
+                port: Some(port.port),
+                name: Some(port.name.clone()),
+                protocol: Some(port.protocol.clone()),
+            });
         }
 
-        // every 15min enforce an election to update all candidates. Every 30min we garbage collect.
-        let now = Instant::now();
-        for candidate in candidates {
-            if let Some(renew_time) = &candidate.spec.renew_time {
-                let renew_instant = time_to_instant(&renew_time.0);
-                if renew_instant + LEASE_CANDIDATE_VALID_DURATION / 2 < now {
-                    return Ok(true);
-                }
-            }
-        }
-
-        let prelim_strategy = pick_best_strategy(candidates)?;
-        if prelim_strategy != "OldestEmulationVersion" {
-            tracing::debug!("Strategy {:?} is ignored by CLE", prelim_strategy);
-            return Ok(false);
-        }
-
-        let prelim_electee = pick_best_leader_oldest_emulation_version(candidates);
-        if let Some(electee) = prelim_electee {
-            if let Some(spec) = &lease.spec {
-                if let Some(holder) = &spec.holder_identity {
-                    if electee.metadata.name.as_ref() == Some(holder) {
-                        tracing::debug!(
-                            "Leader {} is already most optimal for lease {}",
-                            holder,
-                            lease_name
-                        );
-                        return Ok(false);
-                    }
-                }
-            }
-        } else {
-            return Ok(false);
-        }
+        let mut all_addresses = subset.addresses.clone();
+        all_addresses.extend(subset.not_ready_addresses.clone());
         
-        Ok(true)
-    }
-
-    /// reconcileElectionStep steps through a step in an election.
-    /// A step looks at the current state of Lease and LeaseCandidates and takes one of the following action
-    /// - do nothing (because leader is already optimal or still waiting for an event)
-    /// - request ack from candidates (update LeaseCandidate PingTime)
-    /// - finds the most optimal candidate and elect (update the Lease object)
-    /// Instead of keeping a map and lock on election, the state is
-    /// calculated every time by looking at the lease, and set of available candidates.
-    /// PingTime + electionDuration > time.Now: We just asked all candidates to ack and are still waiting for response
-    /// PingTime + electionDuration < time.Now: Candidate has not responded within the appropriate PingTime. Continue the election.
-    /// RenewTime + 5 seconds > time.Now: All candidates acked in the last 5 seconds, continue the election.
-    async fn reconcile_election_step(
-        &self,
-        lease_name: &str,
-        namespace: &str,
-    ) -> Result<Duration, ControllerError> {
-        let candidates = self.list_admissable_candidates(lease_name, namespace).await?;
-        
-        if candidates.is_empty() {
-            return Ok(NO_REQUEUE);
+        if all_addresses_ipv6(&all_addresses) {
+            endpoint_slice.address_type = AddressType::IPv6;
         }
-        
-        tracing::trace!(
-            "Reconciling election for {}/{}, candidates: {}",
-            namespace,
-            lease_name,
-            candidates.len()
+
+        endpoint_slice.endpoints.extend(
+            get_endpoints_from_addresses(&subset.addresses, endpoint_slice.address_type, true)
         );
+        endpoint_slice.endpoints.extend(
+            get_endpoints_from_addresses(&subset.not_ready_addresses, endpoint_slice.address_type, false)
+        );
+    }
 
-        // Check if an election is really needed by looking at the current lease and candidates
-        let need_election = self.election_needed(&candidates, lease_name, namespace).await?;
-        if !need_election {
-            return Ok(DEFAULT_REQUEUE_INTERVAL);
+    endpoint_slice
+}
+
+// getEndpointsFromAddresses returns a list of Endpoints from addresses that
+// match the provided address type.
+fn get_endpoints_from_addresses(
+    addresses: &[EndpointAddress],
+    address_type: AddressType,
+    ready: bool,
+) -> Vec<Endpoint> {
+    let mut endpoints = Vec::new();
+    let is_ipv6_address_type = address_type == AddressType::IPv6;
+
+    for address in addresses {
+        if is_ipv6_string(&address.ip) == is_ipv6_address_type {
+            endpoints.push(endpoint_from_address(address, ready));
+        }
+    }
+
+    endpoints
+}
+
+// endpointFromAddress generates an Endpoint from an EndpointAddress resource.
+fn endpoint_from_address(address: &EndpointAddress, ready: bool) -> Endpoint {
+    let mut ep = Endpoint {
+        addresses: vec![address.ip.clone()],
+        conditions: EndpointConditions {
+            ready: Some(ready),
+        },
+        target_ref: address.target_ref.clone(),
+        node_name: None,
+    };
+
+    if let Some(node_name) = &address.node_name {
+        ep.node_name = Some(node_name.clone());
+    }
+
+    ep
+}
+
+// allAddressesIPv6 returns true if all provided addresses are IPv6.
+fn all_addresses_ipv6(addresses: &[EndpointAddress]) -> bool {
+    if addresses.is_empty() {
+        return false;
+    }
+
+    for address in addresses {
+        if !is_ipv6_string(&address.ip) {
+            return false;
+        }
+    }
+
+    true
+}
+
+// setSkipMirrorTrue sets endpointslice.kubernetes.io/skip-mirror to true. It
+// returns true if this has resulted in a change to the Endpoints resource.
+fn set_skip_mirror_true(e: &mut Endpoints) -> bool {
+    match e.labels.get(LABEL_SKIP_MIRROR) {
+        Some(val) if val == "true" => false,
+        _ => {
+            e.labels.insert(LABEL_SKIP_MIRROR.to_string(), "true".to_string());
+            true
+        }
+    }
+}
+
+// masterCountEndpointReconciler reconciles endpoints based on a specified expected number of
+// masters. masterCountEndpointReconciler implements EndpointReconciler.
+struct MasterCountEndpointReconciler {
+    master_count: i32,
+    ep_adapter: EndpointsAdapter,
+    stop_reconciling_called: bool,
+    reconciling_lock: Mutex<()>,
+}
+
+impl MasterCountEndpointReconciler {
+    // NewMasterCountEndpointReconciler creates a new EndpointReconciler that reconciles based on a
+    // specified expected number of masters.
+    fn new(master_count: i32, ep_adapter: EndpointsAdapter) -> Self {
+        MasterCountEndpointReconciler {
+            master_count,
+            ep_adapter,
+            stop_reconciling_called: false,
+            reconciling_lock: Mutex::new(()),
+        }
+    }
+}
+
+impl EndpointReconciler for MasterCountEndpointReconciler {
+    // ReconcileEndpoints sets the endpoints for the given apiserver service (ro or rw).
+    // ReconcileEndpoints expects that the endpoints objects it manages will all be
+    // managed only by ReconcileEndpoints; therefore, to understand this, you need only
+    // understand the requirements and the body of this function.
+    //
+    // Requirements:
+    //   - All apiservers MUST use the same ports for their {rw, ro} services.
+    //   - All apiservers MUST use ReconcileEndpoints and only ReconcileEndpoints to manage the
+    //     endpoints for their {rw, ro} services.
+    //   - All apiservers MUST know and agree on the number of apiservers expected
+    //     to be running (c.masterCount).
+    //   - ReconcileEndpoints is called periodically from all apiservers.
+    fn reconcile_endpoints(
+        &self,
+        service_name: String,
+        ip: IpAddr,
+        endpoint_ports: Vec<EndpointPort>,
+        reconcile_ports: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _lock = self.reconciling_lock.lock().unwrap();
+
+        if self.stop_reconciling_called {
+            return Ok(());
         }
 
-        let now = Instant::now();
-        let mut can_vote_yet = true;
-        
-        for candidate in &candidates {
-            if let (Some(ping_time), Some(renew_time)) = (&candidate.spec.ping_time, &candidate.spec.renew_time) {
-                let ping_instant = time_to_instant(&ping_time.0);
-                let renew_instant = time_to_instant(&renew_time.0);
-                
-                if ping_instant + ELECTION_DURATION > now && renew_instant < ping_instant {
-                    // continue waiting for the election to timeout
-                    can_vote_yet = false;
-                    continue;
-                }
-            }
-            
-            if let Some(renew_time) = &candidate.spec.renew_time {
-                let renew_instant = time_to_instant(&renew_time.0);
-                if renew_instant + ELECTION_DURATION > now {
-                    continue;
-                }
-            }
-
-            if candidate.spec.ping_time.is_none() ||
-                (candidate.spec.ping_time.as_ref().map(|pt| {
-                    let ping_instant = time_to_instant(&pt.0);
-                    ping_instant + ELECTION_DURATION < now &&
-                        candidate.spec.renew_time.as_ref().map_or(false, |rt| {
-                            time_to_instant(&rt.0) >= ping_instant
-                        })
-                }).unwrap_or(false))
-            {
-                let mut clone = candidate.clone();
-                clone.spec.ping_time = Some(MicroTime(chrono::Utc::now()));
-                
-                let patch = Patch::Merge(&clone);
-                self.lease_candidate_api
-                    .patch(&candidate.metadata.name.as_ref().unwrap(), &PatchParams::default(), &patch)
-                    .await?;
-                can_vote_yet = false;
-            }
-        }
-        
-        if !can_vote_yet {
-            return Ok(DEFAULT_REQUEUE_INTERVAL);
-        }
-
-        // election is ongoing as long as unexpired PingTimes exist
-        for candidate in &candidates {
-            if candidate.spec.ping_time.is_none() {
-                continue; // shouldn't be the case after the above
-            }
-
-            if let Some(renew_time) = &candidate.spec.renew_time {
-                if let Some(ping_time) = &candidate.spec.ping_time {
-                    if time_to_instant(&renew_time.0) >= time_to_instant(&ping_time.0) {
-                        continue; // this has renewed already
-                    }
-                }
-            }
-
-            // If a candidate has a PingTime within the election duration, they have not acked
-            // and we should wait until we receive their response
-            if let Some(ping_time) = &candidate.spec.ping_time {
-                if time_to_instant(&ping_time.0) + ELECTION_DURATION > now {
-                    // continue waiting for the election to timeout
-                    return Ok(NO_REQUEUE);
-                }
-            }
-        }
-
-        let mut acked_candidates = Vec::new();
-        for candidate in &candidates {
-            if let Some(renew_time) = &candidate.spec.renew_time {
-                if time_to_instant(&renew_time.0) + ELECTION_DURATION > now {
-                    acked_candidates.push(candidate.clone());
-                }
-            }
-        }
-        
-        if acked_candidates.is_empty() {
-            return Err(ControllerError::NoAvailableCandidates);
-        }
-
-        let strategy = pick_best_strategy(&acked_candidates)?;
-
-        let mut leader_lease = Lease {
-            metadata: ObjectMeta {
-                namespace: Some(namespace.to_string()),
-                name: Some(lease_name.to_string()),
+        let mut e = match self.ep_adapter.get(NAMESPACE_DEFAULT, &service_name, GetOptions::default()) {
+            Ok(endpoints) => endpoints,
+            Err(_) => Endpoints {
+                object_meta: ObjectMeta {
+                    name: service_name.clone(),
+                    namespace: NAMESPACE_DEFAULT.to_string(),
+                    ..Default::default()
+                },
+                subsets: Vec::new(),
                 ..Default::default()
             },
-            spec: Some(LeaseSpec {
-                strategy: Some(strategy.clone()),
-                lease_duration_seconds: Some(DEFAULT_LEASE_DURATION_SECONDS),
-                renew_time: Some(MicroTime(chrono::Utc::now())),
-                ..Default::default()
-            }),
         };
 
-        match strategy.as_str() {
-            "OldestEmulationVersion" => {
-                let electee = pick_best_leader_oldest_emulation_version(&acked_candidates)
-                    .ok_or(ControllerError::NoSuitableElectee)?;
-                if let Some(spec) = &mut leader_lease.spec {
-                    spec.holder_identity = electee.metadata.name.clone();
-                }
-            }
-            _ => {
-                // do not set the holder identity, but leave it to some other controller. But fall
-                // through to create the lease (without holder).
-                tracing::debug!(
-                    "Election for strategy {:?} is not handled by {}",
-                    strategy,
-                    CONTROLLER_NAME
-                );
-            }
+        // Don't use the EndpointSliceMirroring controller to mirror this to
+        // EndpointSlices. This may change in the future.
+        let skip_mirror_changed = set_skip_mirror_true(&mut e);
+
+        let is_not_found = e.subsets.is_empty() && e.object_meta.resource_version.is_none();
+
+        if is_not_found {
+            // Simply create non-existing endpoints for the service.
+            e.subsets = vec![EndpointSubset {
+                addresses: vec![EndpointAddress {
+                    ip: ip.to_string(),
+                    ..Default::default()
+                }],
+                ports: endpoint_ports,
+                not_ready_addresses: Vec::new(),
+            }];
+            self.ep_adapter.create(NAMESPACE_DEFAULT, &e)?;
+            return Ok(());
         }
 
-        // create the leader election lease
-        match self.lease_api.create(&PostParams::default(), &leader_lease).await {
-            Ok(_) => {
-                if let Some(spec) = &leader_lease.spec {
-                    if let Some(holder) = &spec.holder_identity {
-                        info!("Created lease {}/{} for {:?}", namespace, lease_name, holder);
-                    } else {
-                        info!("Created lease {}/{} without leader", namespace, lease_name);
+        // First, determine if the endpoint is in the format we expect (one
+        // subset, ports matching endpointPorts, N IP addresses).
+        let (format_correct, ip_correct, ports_correct) = check_endpoint_subset_format(
+            &e,
+            &ip.to_string(),
+            &endpoint_ports,
+            self.master_count,
+            reconcile_ports,
+        );
+
+        if !format_correct {
+            // Something is egregiously wrong, just re-make the endpoints record.
+            e.subsets = vec![EndpointSubset {
+                addresses: vec![EndpointAddress {
+                    ip: ip.to_string(),
+                    ..Default::default()
+                }],
+                ports: endpoint_ports,
+                not_ready_addresses: Vec::new(),
+            }];
+            log::warn!("Resetting endpoints for master service {:?} to {:?}", service_name, e);
+            self.ep_adapter.update(NAMESPACE_DEFAULT, &e)?;
+            return Ok(());
+        }
+
+        if !skip_mirror_changed && ip_correct && ports_correct {
+            return self.ep_adapter.ensure_endpoint_slice_from_endpoints(NAMESPACE_DEFAULT, &e);
+        }
+
+        if !ip_correct {
+            // We *always* add our own IP address.
+            e.subsets[0].addresses.push(EndpointAddress {
+                ip: ip.to_string(),
+                ..Default::default()
+            });
+
+            // Lexicographic order is retained by this step.
+            e.subsets = repack_subsets(e.subsets);
+
+            // If too many IP addresses, remove the ones lexicographically after our
+            // own IP address.  Given the requirements stated at the top of
+            // this function, this should cause the list of IP addresses to
+            // become eventually correct.
+            if e.subsets[0].addresses.len() > self.master_count as usize {
+                let addrs = &mut e.subsets[0].addresses;
+                for i in 0..addrs.len() {
+                    if addrs[i].ip == ip.to_string() {
+                        while addrs.len() > self.master_count as usize {
+                            // wrap around if necessary.
+                            let remove = (i + 1) % addrs.len();
+                            addrs.remove(remove);
+                        }
+                        break;
                     }
                 }
-                return Ok(DEFAULT_REQUEUE_INTERVAL);
-            }
-            Err(kube::Error::Api(err)) if err.code == 409 => {
-                // Already exists, continue to update
-            }
-            Err(e) => {
-                return Err(ControllerError::KubeError(e));
             }
         }
 
-        // Get existing lease
-        let existing = self.lease_api.get(lease_name).await?;
-        let orig = existing.clone();
-
-        let mut updated = existing.clone();
-        let is_expired = is_lease_expired(&existing);
-        
-        let no_holder_identity = leader_lease.spec.as_ref()
-            .and_then(|s| s.holder_identity.as_ref())
-            .is_some() && existing.spec.as_ref()
-            .and_then(|s| s.holder_identity.as_ref())
-            .map_or(true, |h| h.is_empty());
-            
-        let expired_and_new_holder = is_expired && 
-            leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref()).is_some() &&
-            existing.spec.as_ref().and_then(|s| s.holder_identity.as_ref()) != 
-            leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
-            
-        let strategy_changed = existing.spec.as_ref()
-            .and_then(|s| s.strategy.as_ref())
-            .map_or(true, |s| s != &strategy);
-            
-        let different_holder = leader_lease.spec.as_ref()
-            .and_then(|s| s.holder_identity.as_ref())
-            .is_some() && 
-            leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref()) !=
-            existing.spec.as_ref().and_then(|s| s.holder_identity.as_ref());
-
-        // Update lease
-        if strategy_changed {
-            info!("Lease {}/{} strategy changed to {:?}", namespace, lease_name, strategy);
-            if let Some(spec) = &mut updated.spec {
-                spec.strategy = Some(strategy.clone());
-            }
-        }
-        
-        if no_holder_identity || expired_and_new_holder {
-            if let Some(spec) = &mut updated.spec {
-                if no_holder_identity {
-                    info!(
-                        "Lease {}/{} had no holder, setting holder to {:?}",
-                        namespace,
-                        lease_name,
-                        leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref())
-                    );
-                } else {
-                    info!(
-                        "Lease {}/{} expired, resetting it and setting holder to {:?}",
-                        namespace,
-                        lease_name,
-                        leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref())
-                    );
-                }
-
-                spec.preferred_holder = None;
-                spec.holder_identity = leader_lease.spec.as_ref()
-                    .and_then(|s| s.holder_identity.clone());
-                spec.renew_time = Some(MicroTime(chrono::Utc::now()));
-                spec.lease_duration_seconds = Some(DEFAULT_LEASE_DURATION_SECONDS);
-                spec.acquire_time = None;
-            }
-        } else if different_holder {
-            if let Some(spec) = &mut updated.spec {
-                info!(
-                    "Lease {}/{} holder changed from {:?} to {:?}",
-                    namespace,
-                    lease_name,
-                    spec.holder_identity,
-                    leader_lease.spec.as_ref().and_then(|s| s.holder_identity.as_ref())
-                );
-                spec.preferred_holder = leader_lease.spec.as_ref()
-                    .and_then(|s| s.holder_identity.clone());
-            }
+        if !ports_correct {
+            // Reset ports.
+            e.subsets[0].ports = endpoint_ports;
         }
 
-        if updated == orig {
-            if let Some(spec) = &existing.spec {
-                if let Some(holder) = &spec.holder_identity {
-                    tracing::debug!(
-                        "Lease {} is managed by a third party strategy",
-                        holder
-                    );
-                } else {
-                    tracing::debug!(
-                        "Lease {}/{} already has the most optimal leader",
-                        namespace,
-                        lease_name
-                    );
-                }
-            }
-            // We need to requeue to ensure that we are aware of an expired lease
-            return Ok(DEFAULT_REQUEUE_INTERVAL);
-        }
-
-        self.lease_api
-            .replace(lease_name, &PostParams::default(), &updated)
-            .await?;
-
-        Ok(DEFAULT_REQUEUE_INTERVAL)
+        log::warn!("Resetting endpoints for master service {:?} to {:?}", service_name, e);
+        self.ep_adapter.update(NAMESPACE_DEFAULT, &e)?;
+        Ok(())
     }
 
-    async fn list_admissable_candidates(
+    fn remove_endpoints(
         &self,
-        lease_name: &str,
-        namespace: &str,
-    ) -> Result<Vec<LeaseCandidate>, ControllerError> {
-        let leases = self.lease_candidate_api.list(&ListParams::default()).await?;
-        
-        let mut results = Vec::new();
-        for l in leases.items {
-            if l.spec.lease_name != lease_name {
-                continue;
+        service_name: String,
+        ip: IpAddr,
+        _endpoint_ports: Vec<EndpointPort>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _lock = self.reconciling_lock.lock().unwrap();
+
+        let mut e = match self.ep_adapter.get(NAMESPACE_DEFAULT, &service_name, GetOptions::default()) {
+            Ok(endpoints) => endpoints,
+            Err(e) if is_not_found(&e) => {
+                // Endpoint doesn't exist
+                return Ok(());
             }
-            if !is_lease_candidate_expired(&l) {
-                results.push(l);
-            } else {
-                info!("LeaseCandidate {} is expired", l.metadata.name.as_ref().unwrap_or(&"unknown".to_string()));
-            }
+            Err(e) => return Err(e),
+        };
+
+        if e.subsets.is_empty() {
+            // no action is needed to remove the endpoint
+            return Ok(());
         }
-        
-        Ok(results)
+
+        // Remove our IP from the list of addresses
+        let new_addresses: Vec<EndpointAddress> = e.subsets[0]
+            .addresses
+            .iter()
+            .filter(|addr| addr.ip != ip.to_string())
+            .cloned()
+            .collect();
+
+        e.subsets[0].addresses = new_addresses;
+        e.subsets = repack_subsets(e.subsets);
+
+        retry_on_conflict(|| {
+            self.ep_adapter.update(NAMESPACE_DEFAULT, &e)
+        })?;
+
+        Ok(())
+    }
+
+    fn stop_reconciling(&self) {
+        let _lock = self.reconciling_lock.lock().unwrap();
+        // Note: In Rust, we can't mutate through &self, so this would need to use
+        // interior mutability (Cell, RefCell, or Atomic) in a real implementation
+        // self.stop_reconciling_called = true;
+    }
+
+    fn destroy(&self) {
+        // No-op in this implementation
     }
 }
 
-impl Clone for Controller {
-    fn clone(&self) -> Self {
-        Self {
-            lease_api: self.lease_api.clone(),
-            lease_candidate_api: self.lease_candidate_api.clone(),
-            client: self.client.clone(),
-        }
+// Determine if the endpoint is in the format ReconcileEndpoints expects.
+//
+// Return values:
+//   - formatCorrect is true if exactly one subset is found.
+//   - ipCorrect is true when current master's IP is found and the number
+//     of addresses is less than or equal to the master count.
+//   - portsCorrect is true when endpoint ports exactly match provided ports.
+//     portsCorrect is only evaluated when reconcilePorts is set to true.
+fn check_endpoint_subset_format(
+    e: &Endpoints,
+    ip: &str,
+    ports: &[EndpointPort],
+    count: i32,
+    reconcile_ports: bool,
+) -> (bool, bool, bool) {
+    if e.subsets.len() != 1 {
+        return (false, false, false);
     }
-}
 
-fn pick_best_leader_oldest_emulation_version(candidates: &[LeaseCandidate]) -> Option<LeaseCandidate> {
-    let mut electee: Option<LeaseCandidate> = None;
-    
-    for c in candidates {
-        if !valid_lease_candidate_for_oldest_emulation_version(c) {
-            continue;
-        }
-        if electee.is_none() || compare(electee.as_ref().unwrap(), c) > 0 {
-            electee = Some(c.clone());
-        }
-    }
-    
-    electee
-}
+    let sub = &e.subsets[0];
+    let mut ports_correct = true;
 
-fn pick_best_strategy(candidates: &[LeaseCandidate]) -> Result<String, ControllerError> {
-    if candidates.is_empty() {
-        return Err(ControllerError::NoCandidates);
-    }
-    
-    let candidate_name = candidates[0].metadata.name.as_ref().unwrap();
-    let mut strategy = candidates[0].spec.strategy.clone();
-    let mut highest_bv = get_binary_version_or_zero(&candidates[0]);
-
-    for c in &candidates[1..] {
-        let bin_version = get_binary_version_or_zero(c);
-        let result = highest_bv.cmp(&bin_version);
-        
-        match result {
-            std::cmp::Ordering::Less => {
-                strategy = c.spec.strategy.clone();
-                highest_bv = bin_version;
-            }
-            std::cmp::Ordering::Equal => {
-                if c.spec.strategy != strategy {
-                    return Err(ControllerError::ConflictingStrategies(
-                        strategy,
-                        c.spec.strategy.clone(),
-                    ));
+    if reconcile_ports {
+        if sub.ports.len() != ports.len() {
+            ports_correct = false;
+        } else {
+            for (i, port) in ports.iter().enumerate() {
+                if i >= sub.ports.len() || *port != sub.ports[i] {
+                    ports_correct = false;
+                    break;
                 }
             }
-            _ => {}
         }
     }
-    
-    Ok(strategy)
+
+    let mut ip_correct = false;
+    for addr in &sub.addresses {
+        if addr.ip == ip {
+            ip_correct = sub.addresses.len() <= count as usize;
+            break;
+        }
+    }
+
+    (true, ip_correct, ports_correct)
 }
 
-fn valid_lease_candidate_for_oldest_emulation_version(l: &LeaseCandidate) -> bool {
-    Version::parse(&l.spec.emulation_version).is_ok() &&
-        Version::parse(&l.spec.binary_version).is_ok()
+// Helper types and functions that would need to be defined based on your Kubernetes client library
+// These are placeholder definitions
+
+#[derive(Clone, Debug, PartialEq)]
+struct EndpointPort {
+    port: i32,
+    name: String,
+    protocol: String,
 }
 
-fn get_emulation_version_or_zero(l: &LeaseCandidate) -> Version {
-    Version::parse(&l.spec.emulation_version).unwrap_or(Version::new(0, 0, 0))
+#[derive(Clone, Debug, Default)]
+struct EndpointAddress {
+    ip: String,
+    node_name: Option<String>,
+    target_ref: Option<ObjectReference>,
 }
 
-fn get_binary_version_or_zero(l: &LeaseCandidate) -> Version {
-    Version::parse(&l.spec.binary_version).unwrap_or(Version::new(0, 0, 0))
+#[derive(Clone, Debug)]
+struct EndpointSubset {
+    addresses: Vec<EndpointAddress>,
+    not_ready_addresses: Vec<EndpointAddress>,
+    ports: Vec<EndpointPort>,
 }
 
-/// -1: lhs better, 1: rhs better
-fn compare(lhs: &LeaseCandidate, rhs: &LeaseCandidate) -> i32 {
-    let l = get_emulation_version_or_zero(lhs);
-    let r = get_emulation_version_or_zero(rhs);
-    
-    match l.cmp(&r) {
-        std::cmp::Ordering::Equal => {
-            let l = get_binary_version_or_zero(lhs);
-            let r = get_binary_version_or_zero(rhs);
-            
-            match l.cmp(&r) {
-                std::cmp::Ordering::Equal => {
-                    if lhs.metadata.creation_timestamp > rhs.metadata.creation_timestamp {
-                        1
-                    } else {
-                        -1
-                    }
-                }
-                std::cmp::Ordering::Less => -1,
-                std::cmp::Ordering::Greater => 1,
+#[derive(Clone, Debug, Default)]
+struct Endpoints {
+    object_meta: ObjectMeta,
+    subsets: Vec<EndpointSubset>,
+}
+
+#[derive(Clone, Debug)]
+struct EndpointSlice {
+    name: String,
+    namespace: String,
+    labels: std::collections::HashMap<String, String>,
+    address_type: AddressType,
+    ports: Vec<EndpointPort>,
+    endpoints: Vec<Endpoint>,
+}
+
+#[derive(Clone, Debug)]
+struct Endpoint {
+    addresses: Vec<String>,
+    conditions: EndpointConditions,
+    target_ref: Option<ObjectReference>,
+    node_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct EndpointConditions {
+    ready: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObjectMeta {
+    name: String,
+    namespace: String,
+    resource_version: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ObjectReference {}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AddressType {
+    IPv4,
+    IPv6,
+}
+
+#[derive(Default)]
+struct GetOptions {}
+
+#[derive(Default)]
+struct CreateOptions {}
+
+#[derive(Default)]
+struct UpdateOptions {}
+
+#[derive(Default)]
+struct DeleteOptions {}
+
+trait EndpointsGetter {
+    fn endpoints(&self, namespace: &str) -> Box<dyn EndpointsInterface>;
+}
+
+trait EndpointsInterface {
+    fn get(&self, name: &str, opts: GetOptions) -> Result<Endpoints, Box<dyn std::error::Error>>;
+    fn create(&self, endpoints: &Endpoints, opts: CreateOptions) -> Result<Endpoints, Box<dyn std::error::Error>>;
+    fn update(&self, endpoints: &Endpoints, opts: UpdateOptions) -> Result<Endpoints, Box<dyn std::error::Error>>;
+}
+
+trait EndpointSlicesGetter {
+    fn endpoint_slices(&self, namespace: &str) -> Box<dyn EndpointSlicesInterface>;
+}
+
+trait EndpointSlicesInterface {
+    fn get(&self, name: &str, opts: GetOptions) -> Result<EndpointSlice, Box<dyn std::error::Error>>;
+    fn create(&self, slice: &EndpointSlice, opts: CreateOptions) -> Result<EndpointSlice, Box<dyn std::error::Error>>;
+    fn update(&self, slice: &EndpointSlice, opts: UpdateOptions) -> Result<EndpointSlice, Box<dyn std::error::Error>>;
+    fn delete(&self, name: &str, opts: DeleteOptions) -> Result<(), Box<dyn std::error::Error>>;
+}
+
+const NAMESPACE_DEFAULT: &str = "default";
+const LABEL_SERVICE_NAME: &str = "kubernetes.io/service-name";
+const LABEL_SKIP_MIRROR: &str = "endpointslice.kubernetes.io/skip-mirror";
+
+fn is_ipv6_string(ip: &str) -> bool {
+    ip.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
+fn is_not_found(_err: &Box<dyn std::error::Error>) -> bool {
+    // Implementation depends on error type
+    false
+}
+
+fn is_already_exists(_err: &Box<dyn std::error::Error>) -> bool {
+    // Implementation depends on error type
+    false
+}
+
+fn semantic_deep_equal<T: PartialEq>(_a: &T, _b: &T) -> bool {
+    // Implementation depends on comparison logic
+    true
+}
+
+fn repack_subsets(subsets: Vec<EndpointSubset>) -> Vec<EndpointSubset> {
+    // Implementation would sort and repack subsets
+    subsets
+}
+
+fn retry_on_conflict<F, T>(f: F) -> Result<T, Box<dyn std::error::Error>>
+where
+    F: Fn() -> Result<T, Box<dyn std::error::Error>>,
+{
+    // Implementation would retry on conflict errors
+    f()
+}
+===============================
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+// Leases is an interface which assists in managing the set of active masters
+trait Leases {
+    // ListLeases retrieves a list of the current master IPs
+    fn list_leases(&self) -> Result<Vec<String>, Box<dyn std::error::Error>>;
+
+    // UpdateLease adds or refreshes a master's lease
+    fn update_lease(&self, ip: String) -> Result<(), Box<dyn std::error::Error>>;
+
+    // RemoveLease removes a master's lease
+    fn remove_lease(&self, ip: String) -> Result<(), Box<dyn std::error::Error>>;
+
+    // Destroy cleans up everything on shutdown.
+    fn destroy(&self);
+}
+
+struct StorageLeases {
+    storage: Box<dyn StorageInterface>,
+    destroy_fn: Box<dyn Fn() + Send + Sync>,
+    base_key: String,
+    lease_time: Duration,
+}
+
+impl Leases for StorageLeases {
+    // ListLeases retrieves a list of the current master IPs from storage
+    fn list_leases(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let mut ip_info_list = EndpointsList::default();
+        let storage_opts = ListOptions {
+            resource_version: "0".to_string(),
+            resource_version_match: ResourceVersionMatch::NotOlderThan,
+            predicate: Predicate::Everything,
+            recursive: true,
+        };
+
+        self.storage.get_list(
+            &new_default_context(),
+            &self.base_key,
+            storage_opts,
+            &mut ip_info_list,
+        )?;
+
+        let mut ip_list = Vec::with_capacity(ip_info_list.items.len());
+        for ip in &ip_info_list.items {
+            if !ip.subsets.is_empty()
+                && !ip.subsets[0].addresses.is_empty()
+                && !ip.subsets[0].addresses[0].ip.is_empty()
+            {
+                ip_list.push(ip.subsets[0].addresses[0].ip.clone());
             }
         }
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Greater => 1,
+
+        log::debug!("Current master IPs listed in storage are {:?}", ip_list);
+
+        Ok(ip_list)
+    }
+
+    // UpdateLease resets the TTL on a master IP in storage
+    // UpdateLease will create a new key if it doesn't exist.
+    fn update_lease(&self, ip: String) -> Result<(), Box<dyn std::error::Error>> {
+        let key = format!("{}/{}", self.base_key, ip);
+        let ip_clone = ip.clone();
+        let lease_time = self.lease_time;
+
+        self.storage.guaranteed_update(
+            &new_default_context(),
+            &key,
+            &Endpoints::default(),
+            true,
+            None,
+            Box::new(move |input: &dyn RuntimeObject, _resp_meta: &ResponseMeta| {
+                // just make sure we've got the right IP set, and then refresh the TTL
+                let mut existing = input.as_any().downcast_ref::<Endpoints>().unwrap().clone();
+                existing.subsets = vec![EndpointSubset {
+                    addresses: vec![EndpointAddress {
+                        ip: ip_clone.clone(),
+                        node_name: None,
+                        target_ref: None,
+                    }],
+                    not_ready_addresses: Vec::new(),
+                    ports: Vec::new(),
+                }];
+
+                // leaseTime needs to be in seconds
+                let lease_time_secs = lease_time.as_secs();
+
+                // NB: GuaranteedUpdate does not perform the store operation unless
+                // something changed between load and store (not including resource
+                // version), meaning we can't refresh the TTL without actually
+                // changing a field.
+                existing.generation += 1;
+
+                log::debug!(
+                    "Resetting TTL on master IP {:?} listed in storage to {}",
+                    ip_clone,
+                    lease_time_secs
+                );
+
+                Ok((Box::new(existing) as Box<dyn RuntimeObject>, Some(lease_time_secs)))
+            }),
+            None,
+        )
+    }
+
+    // RemoveLease removes the lease on a master IP in storage
+    fn remove_lease(&self, ip: String) -> Result<(), Box<dyn std::error::Error>> {
+        let key = format!("{}/{}", self.base_key, ip);
+        self.storage.delete(
+            &new_default_context(),
+            &key,
+            &Endpoints::default(),
+            None,
+            validate_all_object_func,
+            None,
+            DeleteOptions::default(),
+        )
+    }
+
+    fn destroy(&self) {
+        (self.destroy_fn)();
     }
 }
 
-fn is_lease_expired(lease: &Lease) -> bool {
-    let now = chrono::Utc::now();
-    
-    lease.spec.as_ref().map_or(true, |spec| {
-        spec.renew_time.is_none() ||
-            spec.lease_duration_seconds.is_none() ||
-            spec.renew_time.as_ref().map_or(true, |rt| {
-                let duration = Duration::from_secs(spec.lease_duration_seconds.unwrap() as u64);
-                rt.0 + chrono::Duration::from_std(duration).unwrap() < now
-            })
+// NewLeases creates a new etcd-based Leases implementation.
+fn new_leases(
+    config: &ConfigForResource,
+    base_key: String,
+    lease_time: Duration,
+) -> Result<Box<dyn Leases>, Box<dyn std::error::Error>> {
+    // note that newFunc, newListFunc and resourcePrefix
+    // can be left blank unless the storage.Watch method is used
+    let (lease_storage, destroy_fn) = storage_factory_create(config, None, None, "")?;
+
+    let once = Arc::new(Mutex::new(Some(destroy_fn)));
+    let destroy_fn_once = move || {
+        let mut guard = once.lock().unwrap();
+        if let Some(f) = guard.take() {
+            f();
+        }
+    };
+
+    Ok(Box::new(StorageLeases {
+        storage: lease_storage,
+        destroy_fn: Box::new(destroy_fn_once),
+        base_key,
+        lease_time,
+    }))
+}
+
+struct LeaseEndpointReconciler {
+    ep_adapter: EndpointsAdapter,
+    master_leases: Box<dyn Leases>,
+    stop_reconciling_called: AtomicBool,
+    reconciling_lock: Mutex<()>,
+}
+
+// NewLeaseEndpointReconciler creates a new LeaseEndpoint reconciler
+fn new_lease_endpoint_reconciler(
+    ep_adapter: EndpointsAdapter,
+    master_leases: Box<dyn Leases>,
+) -> Box<dyn EndpointReconciler> {
+    Box::new(LeaseEndpointReconciler {
+        ep_adapter,
+        master_leases,
+        stop_reconciling_called: AtomicBool::new(false),
+        reconciling_lock: Mutex::new(()),
     })
 }
 
-fn is_lease_candidate_expired(lease: &LeaseCandidate) -> bool {
-    let now = chrono::Utc::now();
-    
-    lease.spec.renew_time.is_none() ||
-        lease.spec.renew_time.as_ref().map_or(true, |rt| {
-            rt.0 + chrono::Duration::from_std(LEASE_CANDIDATE_VALID_DURATION).unwrap() < now
-        })
-}
+impl EndpointReconciler for LeaseEndpointReconciler {
+    // ReconcileEndpoints lists keys in a special etcd directory.
+    // Each key is expected to have a TTL of R+n, where R is the refresh interval
+    // at which this function is called, and n is some small value.  If an
+    // apiserver goes down, it will fail to refresh its key's TTL and the key will
+    // expire. ReconcileEndpoints will notice that the endpoints object is
+    // different from the directory listing, and update the endpoints object
+    // accordingly.
+    fn reconcile_endpoints(
+        &self,
+        service_name: String,
+        ip: IpAddr,
+        endpoint_ports: Vec<EndpointPort>,
+        reconcile_ports: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // reconcile endpoints only if apiserver was not shutdown
+        if self.stop_reconciling_called.load(Ordering::SeqCst) {
+            return Ok(());
+        }
 
-fn time_to_instant(time: &chrono::DateTime<chrono::Utc>) -> Instant {
-    // This is a simplified conversion - in production you'd need proper time handling
-    let now = chrono::Utc::now();
-    let diff = time.signed_duration_since(now);
-    
-    if diff.num_milliseconds() > 0 {
-        Instant::now() + Duration::from_millis(diff.num_milliseconds() as u64)
-    } else {
-        Instant::now() - Duration::from_millis((-diff.num_milliseconds()) as u64)
+        // Ensure that there will be no race condition with the RemoveEndpoints.
+        let _lock = self.reconciling_lock.lock().unwrap();
+
+        // Refresh the TTL on our key, independently of whether any error or
+        // update conflict happens below. This makes sure that at least some of
+        // the masters will add our endpoint.
+        self.master_leases.update_lease(ip.to_string())?;
+
+        self.do_reconcile(service_name, endpoint_ports, reconcile_ports)
+    }
+
+    fn remove_endpoints(
+        &self,
+        service_name: String,
+        ip: IpAddr,
+        endpoint_ports: Vec<EndpointPort>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Ensure that there will be no race condition with the ReconcileEndpoints.
+        let _lock = self.reconciling_lock.lock().unwrap();
+
+        self.master_leases.remove_lease(ip.to_string())?;
+
+        self.do_reconcile(service_name, endpoint_ports, true)
+    }
+
+    fn stop_reconciling(&self) {
+        self.stop_reconciling_called.store(true, Ordering::SeqCst);
+    }
+
+    fn destroy(&self) {
+        self.master_leases.destroy();
     }
 }
 
+impl LeaseEndpointReconciler {
+    // doReconcile can be called from ReconcileEndpoints() or RemoveEndpoints().
+    // it is NOT SAFE to call it from multiple goroutines.
+    fn do_reconcile(
+        &self,
+        service_name: String,
+        endpoint_ports: Vec<EndpointPort>,
+        reconcile_ports: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut should_create = false;
+        let mut e = match self.ep_adapter.get(
+            NAMESPACE_DEFAULT,
+            &service_name,
+            GetOptions::default(),
+        ) {
+            Ok(endpoints) => endpoints,
+            Err(err) => {
+                if !is_not_found(&err) {
+                    return Err(err);
+                }
+
+                // there are no endpoints and we should stop reconciling
+                if self.stop_reconciling_called.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+
+                should_create = true;
+                Endpoints {
+                    object_meta: ObjectMeta {
+                        name: service_name.clone(),
+                        namespace: NAMESPACE_DEFAULT.to_string(),
+                        ..Default::default()
+                    },
+                    subsets: Vec::new(),
+                    generation: 0,
+                }
+            }
+        };
+
+        // ... and the list of master IP keys from etcd
+        let master_ips = self.master_leases.list_leases()?;
+
+        // Since we just refreshed our own key, assume that zero endpoints
+        // returned from storage indicates an issue or invalid state, and thus do
+        // not update the endpoints list based on the result.
+        // If the controller was ordered to stop and is this is the last apiserver
+        // we keep going to remove our endpoint before shutting down.
+        if !self.stop_reconciling_called.load(Ordering::SeqCst) && master_ips.is_empty() {
+            return Err("no API server IP addresses were listed in storage, refusing to erase all endpoints for the kubernetes Service".into());
+        }
+
+        // Don't use the EndpointSliceMirroring controller to mirror this to
+        // EndpointSlices. This may change in the future.
+        let skip_mirror_changed = set_skip_mirror_true(&mut e);
+
+        // Next, we compare the current list of endpoints with the list of master IP keys
+        let (format_correct, ip_correct, ports_correct) =
+            check_endpoint_subset_format_with_lease(&e, &master_ips, &endpoint_ports, reconcile_ports);
+
+        if !skip_mirror_changed && format_correct && ip_correct && ports_correct {
+            return self
+                .ep_adapter
+                .ensure_endpoint_slice_from_endpoints(NAMESPACE_DEFAULT, &e);
+        }
+
+        if !format_correct {
+            // Something is egregiously wrong, just re-make the endpoints record.
+            e.subsets = vec![EndpointSubset {
+                addresses: Vec::new(),
+                not_ready_addresses: Vec::new(),
+                ports: endpoint_ports.clone(),
+            }];
+        }
+
+        if !format_correct || !ip_correct {
+            // repopulate the addresses according to the expected IPs from etcd
+            e.subsets[0].addresses = master_ips
+                .iter()
+                .map(|ip| EndpointAddress {
+                    ip: ip.clone(),
+                    node_name: None,
+                    target_ref: None,
+                })
+                .collect();
+
+            // Lexicographic order is retained by this step.
+            e.subsets = repack_subsets(e.subsets);
+        }
+
+        if !e.subsets.is_empty() && !ports_correct {
+            // Reset ports.
+            e.subsets[0].ports = endpoint_ports;
+        }
+
+        log::warn!(
+            "Resetting endpoints for master service {:?} to {:?}",
+            service_name,
+            master_ips
+        );
+
+        if should_create {
+            match self.ep_adapter.create(NAMESPACE_DEFAULT, &e) {
+                Ok(_) => Ok(()),
+                Err(err) if is_already_exists(&err) => Ok(()),
+                Err(err) => Err(err),
+            }
+        } else {
+            self.ep_adapter.update(NAMESPACE_DEFAULT, &e)?;
+            Ok(())
+        }
+    }
+}
+
+// checkEndpointSubsetFormatWithLease determines if the endpoint is in the
+// format ReconcileEndpoints expects when the controller is using leases.
+//
+// Return values:
+//   - formatCorrect is true if exactly one subset is found.
+//   - ipsCorrect when the addresses in the endpoints match the expected addresses list
+//   - portsCorrect is true when endpoint ports exactly match provided ports.
+//     portsCorrect is only evaluated when reconcilePorts is set to true.
+fn check_endpoint_subset_format_with_lease(
+    e: &Endpoints,
+    expected_ips: &[String],
+    ports: &[EndpointPort],
+    reconcile_ports: bool,
+) -> (bool, bool, bool) {
+    if e.subsets.len() != 1 {
+        return (false, false, false);
+    }
+
+    let sub = &e.subsets[0];
+    let mut ports_correct = true;
+
+    if reconcile_ports {
+        if sub.ports.len() != ports.len() {
+            ports_correct = false;
+        } else {
+            for (i, port) in ports.iter().enumerate() {
+                if *port != sub.ports[i] {
+                    ports_correct = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut ips_correct = true;
+    if sub.addresses.len() != expected_ips.len() {
+        ips_correct = false;
+    } else {
+        // check the actual content of the addresses
+        // present addrs is used as a set (the keys) and to indicate if a
+        // value was already found (the values)
+        let mut present_addrs: HashMap<String, bool> = expected_ips
+            .iter()
+            .map(|ip| (ip.clone(), false))
+            .collect();
+
+        // uniqueness is assumed amongst all Addresses.
+        for addr in &sub.addresses {
+            match present_addrs.get_mut(&addr.ip) {
+                Some(already_seen) => {
+                    if *already_seen {
+                        ips_correct = false;
+                        break;
+                    }
+                    *already_seen = true;
+                }
+                None => {
+                    ips_correct = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    (true, ips_correct, ports_correct)
+}
+
+// Helper types and trait definitions
+// These would need to be properly defined based on your Kubernetes client library
+
+trait StorageInterface: Send + Sync {
+    fn get_list(
+        &self,
+        ctx: &Context,
+        key: &str,
+        opts: ListOptions,
+        list: &mut EndpointsList,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn guaranteed_update(
+        &self,
+        ctx: &Context,
+        key: &str,
+        destination: &Endpoints,
+        ignore_not_found: bool,
+        preconditions: Option<Box<dyn Preconditions>>,
+        try_update: Box<dyn Fn(&dyn RuntimeObject, &ResponseMeta) -> Result<(Box<dyn RuntimeObject>, Option<u64>), Box<dyn std::error::Error>>>,
+        suggestion: Option<Box<dyn RuntimeObject>>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+
+    fn delete(
+        &self,
+        ctx: &Context,
+        key: &str,
+        out: &Endpoints,
+        preconditions: Option<Box<dyn Preconditions>>,
+        validate_func: fn(&dyn RuntimeObject) -> Result<(), Box<dyn std::error::Error>>,
+        cached_existing_object: Option<Box<dyn RuntimeObject>>,
+        opts: DeleteOptions,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+}
+
+trait RuntimeObject: Send + Sync {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+struct Context {}
+
+struct ListOptions {
+    resource_version: String,
+    resource_version_match: ResourceVersionMatch,
+    predicate: Predicate,
+    recursive: bool,
+}
+
+enum ResourceVersionMatch {
+    NotOlderThan,
+}
+
+enum Predicate {
+    Everything,
+}
+
+struct ResponseMeta {}
+
+trait Preconditions: Send + Sync {}
+
+#[derive(Default)]
+struct DeleteOptions {}
+
+#[derive(Default)]
+struct EndpointsList {
+    items: Vec<Endpoints>,
+}
+
+#[derive(Clone, Default)]
+struct Endpoints {
+    object_meta: ObjectMeta,
+    subsets: Vec<EndpointSubset>,
+    generation: i64,
+}
+
+impl RuntimeObject for Endpoints {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+struct ConfigForResource {}
+
+fn new_default_context() -> Context {
+    Context {}
+}
+
+fn validate_all_object_func(_obj: &dyn RuntimeObject) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+fn storage_factory_create(
+    _config: &ConfigForResource,
+    _new_func: Option<Box<dyn Fn()>>,
+    _new_list_func: Option<Box<dyn Fn()>>,
+    _resource_prefix: &str,
+) -> Result<(Box<dyn StorageInterface>, Box<dyn Fn()>), Box<dyn std::error::Error>> {
+    // Implementation would create storage interface
+    unimplemented!("storage_factory_create needs to be implemented")
+}
+
+const NAMESPACE_DEFAULT: &str = "default";
