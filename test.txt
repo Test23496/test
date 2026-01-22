@@ -1,281 +1,1694 @@
-use std::collections::HashMap;
-use std::cmp::Ordering;
-use md5::{Md5, Digest};
+下面是将Go代码翻译成Rust的版本：
+use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
+use std::time::Duration;
 
-// RepackSubsets takes a slice of EndpointSubset objects, expands it to the full
-// representation, and then repacks that into the canonical layout.  This
-// ensures that code which operates on these objects can rely on the common
-// form for things like comparison.  The result is a newly allocated slice.
-fn repack_subsets(subsets: Vec<EndpointSubset>) -> Vec<EndpointSubset> {
-    // First map each unique port definition to the sets of hosts that
-    // offer it.
-    let mut all_addrs: HashMap<AddressKey, EndpointAddress> = HashMap::new();
-    let mut port_to_addr_ready_map: HashMap<EndpointPort, AddressSet> = HashMap::new();
+// OverlappingBuiltInResources returns the set of built-in group/resources that are persisted
+// in storage paths that overlap with CRD storage paths, and should not be deleted
+// by this controller if an associated CRD is deleted.
+pub fn overlapping_built_in_resources() -> HashMap<GroupResource, bool> {
+    let mut map = HashMap::new();
+    map.insert(
+        GroupResource {
+            group: "apiregistration.k8s.io".to_string(),
+            resource: "apiservices".to_string(),
+        },
+        true,
+    );
+    map.insert(
+        GroupResource {
+            group: "apiextensions.k8s.io".to_string(),
+            resource: "customresourcedefinitions".to_string(),
+        },
+        true,
+    );
+    map
+}
 
-    for subset in &subsets {
-        if subset.ports.is_empty() {
-            // Don't discard endpoints with no ports defined, use a sentinel.
-            map_addresses_by_port(
-                subset,
-                EndpointPort { port: -1, ..Default::default() },
-                &mut all_addrs,
-                &mut port_to_addr_ready_map,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GroupResource {
+    pub group: String,
+    pub resource: String,
+}
+
+// CRDFinalizer is a controller that finalizes the CRD by deleting all the CRs associated with it.
+pub struct CRDFinalizer {
+    crd_client: Arc<dyn CustomResourceDefinitionsGetter>,
+    cr_client_getter: Arc<dyn CRClientGetter>,
+    crd_lister: Arc<dyn CustomResourceDefinitionLister>,
+    crd_synced: Arc<dyn Fn() -> bool + Send + Sync>,
+    // To allow injection for testing.
+    sync_fn: Box<dyn Fn(&str) -> Result<(), Box<dyn std::error::Error>> + Send + Sync>,
+    queue: Arc<dyn TypedRateLimitingQueue<String>>,
+}
+
+// ListerCollectionDeleter combines rest.Lister and rest.CollectionDeleter.
+pub trait ListerCollectionDeleter: Lister + CollectionDeleter {}
+
+pub trait Lister: Send + Sync {
+    fn list(&self, ctx: Context, options: Option<ListOptions>) -> Result<Box<dyn std::any::Any>, Box<dyn std::error::Error>>;
+}
+
+pub trait CollectionDeleter: Send + Sync {
+    fn delete_collection(
+        &self,
+        ctx: Context,
+        validate_fn: ValidateAllObjectFunc,
+        delete_options: Option<DeleteOptions>,
+        list_options: Option<ListOptions>,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+}
+
+// CRClientGetter knows how to get a ListerCollectionDeleter for a given CRD UID.
+pub trait CRClientGetter: Send + Sync {
+    // GetCustomResourceListerCollectionDeleter gets the ListerCollectionDeleter for the given CRD
+    // UID.
+    fn get_custom_resource_lister_collection_deleter(
+        &self,
+        crd: &CustomResourceDefinition,
+    ) -> Result<Arc<dyn ListerCollectionDeleter>, Box<dyn std::error::Error>>;
+}
+
+pub trait CustomResourceDefinitionsGetter: Send + Sync {
+    fn custom_resource_definitions(&self) -> Arc<dyn CustomResourceDefinitionInterface>;
+}
+
+pub trait CustomResourceDefinitionInterface: Send + Sync {
+    fn update_status(
+        &self,
+        ctx: Context,
+        crd: &CustomResourceDefinition,
+        options: UpdateOptions,
+    ) -> Result<CustomResourceDefinition, Box<dyn std::error::Error>>;
+}
+
+pub trait CustomResourceDefinitionLister: Send + Sync {
+    fn get(&self, name: &str) -> Result<CustomResourceDefinition, Box<dyn std::error::Error>>;
+}
+
+pub trait TypedRateLimitingQueue<T>: Send + Sync {
+    fn add(&self, item: T);
+    fn get(&self) -> (T, bool);
+    fn done(&self, item: T);
+    fn forget(&self, item: T);
+    fn add_rate_limited(&self, item: T);
+    fn shut_down(&self);
+}
+
+// NewCRDFinalizer creates a new CRDFinalizer.
+pub fn new_crd_finalizer(
+    crd_informer: Arc<dyn CustomResourceDefinitionInformer>,
+    crd_client: Arc<dyn CustomResourceDefinitionsGetter>,
+    cr_client_getter: Arc<dyn CRClientGetter>,
+) -> CRDFinalizer {
+    let crd_lister = crd_informer.lister();
+    let crd_synced = crd_informer.informer().has_synced();
+    let queue = create_typed_rate_limiting_queue("crd_finalizer");
+
+    let mut c = CRDFinalizer {
+        crd_client,
+        crd_lister,
+        crd_synced,
+        cr_client_getter,
+        sync_fn: Box::new(|_| Ok(())), // placeholder
+        queue,
+    };
+
+    let queue_clone = c.queue.clone();
+    crd_informer.informer().add_event_handler(ResourceEventHandlerFuncs {
+        add_func: Box::new(move |obj| add_custom_resource_definition(obj, queue_clone.clone())),
+        update_func: Box::new(move |old_obj, new_obj| {
+            update_custom_resource_definition(old_obj, new_obj, queue_clone.clone())
+        }),
+    });
+
+    c
+}
+
+impl CRDFinalizer {
+    fn sync(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let cached_crd = match self.crd_lister.get(key) {
+            Ok(crd) => crd,
+            Err(err) if is_not_found(&err) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+
+        // no work to do
+        if cached_crd.deletion_timestamp.is_zero()
+            || !crd_has_finalizer(&cached_crd, CUSTOM_RESOURCE_CLEANUP_FINALIZER)
+        {
+            return Ok(());
+        }
+
+        let mut crd = cached_crd.deep_copy();
+
+        // update the status condition. This cleanup could take a while.
+        set_crd_condition(
+            &mut crd,
+            CustomResourceDefinitionCondition {
+                type_: ConditionType::Terminating,
+                status: ConditionStatus::True,
+                reason: "InstanceDeletionInProgress".to_string(),
+                message: "CustomResource deletion is in progress".to_string(),
+                last_transition_time: Time::now(),
+            },
+        );
+
+        crd = match self
+            .crd_client
+            .custom_resource_definitions()
+            .update_status(Context::todo(), &crd, UpdateOptions::default())
+        {
+            Ok(crd) => crd,
+            Err(err) if is_not_found(&err) || is_conflict(&err) => {
+                // deleted or changed in the meantime, we'll get called again
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+
+        // Now we can start deleting items. We should use the REST API to ensure that all normal admission runs.
+        // Since we control the endpoints, we know that delete collection works. No need to delete if not established.
+        if overlapping_built_in_resources().contains_key(&GroupResource {
+            group: crd.spec.group.clone(),
+            resource: crd.spec.names.plural.clone(),
+        }) {
+            // Skip deletion, explain why, and proceed to remove the finalizer and delete the CRD
+            set_crd_condition(
+                &mut crd,
+                CustomResourceDefinitionCondition {
+                    type_: ConditionType::Terminating,
+                    status: ConditionStatus::False,
+                    reason: "OverlappingBuiltInResource".to_string(),
+                    message: "instances overlap with built-in resources in storage".to_string(),
+                    last_transition_time: Time::now(),
+                },
             );
+        } else if is_crd_condition_true(&crd, ConditionType::Established) {
+            let (cond, delete_err) = self.delete_instances(&crd);
+            set_crd_condition(&mut crd, cond);
+            if let Err(delete_err) = delete_err {
+                if let Err(err) = self
+                    .crd_client
+                    .custom_resource_definitions()
+                    .update_status(Context::todo(), &crd, UpdateOptions::default())
+                {
+                    handle_error(err);
+                }
+                return Err(delete_err);
+            }
         } else {
-            for port in &subset.ports {
-                map_addresses_by_port(
-                    subset,
-                    port.clone(),
-                    &mut all_addrs,
-                    &mut port_to_addr_ready_map,
+            set_crd_condition(
+                &mut crd,
+                CustomResourceDefinitionCondition {
+                    type_: ConditionType::Terminating,
+                    status: ConditionStatus::False,
+                    reason: "NeverEstablished".to_string(),
+                    message: "resource was never established".to_string(),
+                    last_transition_time: Time::now(),
+                },
+            );
+        }
+
+        crd_remove_finalizer(&mut crd, CUSTOM_RESOURCE_CLEANUP_FINALIZER);
+        match self
+            .crd_client
+            .custom_resource_definitions()
+            .update_status(Context::todo(), &crd, UpdateOptions::default())
+        {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) || is_conflict(&err) => {
+                // deleted or changed in the meantime, we'll get called again
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn delete_instances(
+        &self,
+        crd: &CustomResourceDefinition,
+    ) -> (
+        CustomResourceDefinitionCondition,
+        Result<(), Box<dyn std::error::Error>>,
+    ) {
+        // Now we can start deleting items. While it would be ideal to use a REST API client, doing so
+        // could incorrectly delete a ThirdPartyResource with the same URL as the CustomResource, so we go
+        // directly to the storage instead. Since we control the storage, we know that delete collection works.
+        let cr_client = match self.cr_client_getter.get_custom_resource_lister_collection_deleter(crd) {
+            Ok(client) => client,
+            Err(err) => {
+                let err_msg = format!(
+                    "unable to find a custom resource client for {}.{}: {:?}",
+                    crd.status.accepted_names.plural, crd.spec.group, err
+                );
+                return (
+                    CustomResourceDefinitionCondition {
+                        type_: ConditionType::Terminating,
+                        status: ConditionStatus::True,
+                        reason: "InstanceDeletionFailed".to_string(),
+                        message: format!("could not list instances: {:?}", err),
+                        last_transition_time: Time::now(),
+                    },
+                    Err(err),
+                );
+            }
+        };
+
+        let ctx = new_context();
+        let all_resources = match cr_client.list(ctx.clone(), None) {
+            Ok(resources) => resources,
+            Err(err) => {
+                return (
+                    CustomResourceDefinitionCondition {
+                        type_: ConditionType::Terminating,
+                        status: ConditionStatus::True,
+                        reason: "InstanceDeletionFailed".to_string(),
+                        message: format!("could not list instances: {:?}", err),
+                        last_transition_time: Time::now(),
+                    },
+                    Err(err),
+                );
+            }
+        };
+
+        let mut deleted_namespaces = HashSet::new();
+        let mut delete_errors = Vec::new();
+
+        let unstructured_list = all_resources
+            .downcast_ref::<UnstructuredList>()
+            .unwrap();
+
+        for item in &unstructured_list.items {
+            let metadata = match get_accessor(item) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    handle_error(err);
+                    continue;
+                }
+            };
+
+            if deleted_namespaces.contains(&metadata.get_namespace()) {
+                continue;
+            }
+
+            // don't retry deleting the same namespace
+            deleted_namespaces.insert(metadata.get_namespace().clone());
+            let ns_ctx = with_namespace(ctx.clone(), &metadata.get_namespace());
+
+            if let Err(err) =
+                cr_client.delete_collection(ns_ctx, validate_all_object_func, None, None)
+            {
+                delete_errors.push(err);
+                continue;
+            }
+        }
+
+        if !delete_errors.is_empty() {
+            let delete_error = aggregate_errors(delete_errors);
+            return (
+                CustomResourceDefinitionCondition {
+                    type_: ConditionType::Terminating,
+                    status: ConditionStatus::True,
+                    reason: "InstanceDeletionFailed".to_string(),
+                    message: format!("could not issue all deletes: {:?}", delete_error),
+                    last_transition_time: Time::now(),
+                },
+                Err(delete_error),
+            );
+        }
+
+        // now we need to wait until all the resources are deleted. Start with a simple poll before we do anything fancy.
+        // TODO not all servers are synchronized on caches. It is possible for a stale one to still be creating things.
+        // Once we have a mechanism for servers to indicate their states, we should check that for concurrence.
+        let result = poll_until_context_timeout(
+            ctx.clone(),
+            Duration::from_secs(5),
+            Duration::from_secs(60),
+            true,
+            |ctx| {
+                let list_obj = cr_client.list(ctx, None)?;
+                let unstructured_list = list_obj.downcast_ref::<UnstructuredList>().unwrap();
+                if unstructured_list.items.is_empty() {
+                    return Ok(true);
+                }
+                log_v2(&format!(
+                    "{}.{} waiting for {} items to be removed",
+                    crd.status.accepted_names.plural,
+                    crd.spec.group,
+                    unstructured_list.items.len()
+                ));
+                Ok(false)
+            },
+        );
+
+        match result {
+            Ok(_) => (
+                CustomResourceDefinitionCondition {
+                    type_: ConditionType::Terminating,
+                    status: ConditionStatus::False,
+                    reason: "InstanceDeletionCompleted".to_string(),
+                    message: "removed all instances".to_string(),
+                    last_transition_time: Time::now(),
+                },
+                Ok(()),
+            ),
+            Err(err) => (
+                CustomResourceDefinitionCondition {
+                    type_: ConditionType::Terminating,
+                    status: ConditionStatus::True,
+                    reason: "InstanceDeletionCheck".to_string(),
+                    message: format!("could not confirm zero CustomResources remaining: {:?}", err),
+                    last_transition_time: Time::now(),
+                },
+                Err(err),
+            ),
+        }
+    }
+
+    pub fn run(&self, workers: usize, stop_ch: tokio::sync::broadcast::Receiver<()>) {
+        defer_handle_crash();
+        defer_shutdown(&self.queue);
+
+        log_info("Starting CRDFinalizer");
+        defer_log_info("Shutting down CRDFinalizer");
+
+        if !wait_for_cache_sync(stop_ch.resubscribe(), &self.crd_synced) {
+            return;
+        }
+
+        for _ in 0..workers {
+            let worker = self.clone();
+            tokio::spawn(async move {
+                wait_until(
+                    || worker.run_worker(),
+                    Duration::from_secs(1),
+                    stop_ch.resubscribe(),
+                );
+            });
+        }
+
+        let _ = stop_ch.recv();
+    }
+
+    fn run_worker(&self) {
+        while self.process_next_work_item() {}
+    }
+
+    // processNextWorkItem deals with one key off the queue. It returns false when it's time to quit.
+    fn process_next_work_item(&self) -> bool {
+        let (key, quit) = self.queue.get();
+        if quit {
+            return false;
+        }
+
+        let result = (self.sync_fn)(&key);
+
+        self.queue.done(key.clone());
+
+        match result {
+            Ok(_) => {
+                self.queue.forget(key);
+                true
+            }
+            Err(err) => {
+                handle_error(Box::new(format!("{} failed with: {:?}", key, err)));
+                self.queue.add_rate_limited(key);
+                true
+            }
+        }
+    }
+
+    fn enqueue(&self, obj: &CustomResourceDefinition) {
+        let key = match deletion_handling_meta_namespace_key_func(obj) {
+            Ok(k) => k,
+            Err(err) => {
+                handle_error(Box::new(format!("couldn't get key for object {:?}: {:?}", obj, err)));
+                return;
+            }
+        };
+
+        self.queue.add(key);
+    }
+}
+
+fn add_custom_resource_definition(
+    obj: Box<dyn std::any::Any>,
+    queue: Arc<dyn TypedRateLimitingQueue<String>>,
+) {
+    let cast_obj = obj.downcast_ref::<CustomResourceDefinition>().unwrap();
+    // only queue deleted things
+    if !cast_obj.deletion_timestamp.is_zero()
+        && crd_has_finalizer(cast_obj, CUSTOM_RESOURCE_CLEANUP_FINALIZER)
+    {
+        enqueue_helper(cast_obj, queue);
+    }
+}
+
+fn update_custom_resource_definition(
+    old_obj: Box<dyn std::any::Any>,
+    new_obj: Box<dyn std::any::Any>,
+    queue: Arc<dyn TypedRateLimitingQueue<String>>,
+) {
+    let old_crd = old_obj.downcast_ref::<CustomResourceDefinition>().unwrap();
+    let new_crd = new_obj.downcast_ref::<CustomResourceDefinition>().unwrap();
+
+    // only queue deleted things that haven't been finalized by us
+    if new_crd.deletion_timestamp.is_zero()
+        || !crd_has_finalizer(new_crd, CUSTOM_RESOURCE_CLEANUP_FINALIZER)
+    {
+        return;
+    }
+
+    // always requeue resyncs just in case
+    if old_crd.resource_version == new_crd.resource_version {
+        enqueue_helper(new_crd, queue);
+        return;
+    }
+
+    // If the only difference is in the terminating condition, then there's no reason to requeue here. This controller
+    // is likely to be the originator, so requeuing would hot-loop us. Failures are requeued by the workqueue directly.
+    // This is a low traffic and scale resource, so the copy is terrible. It's not good, so better ideas
+    // are welcome.
+    let mut old_copy = old_crd.deep_copy();
+    let mut new_copy = new_crd.deep_copy();
+    old_copy.resource_version = String::new();
+    new_copy.resource_version = String::new();
+    remove_crd_condition(&mut old_copy, ConditionType::Terminating);
+    remove_crd_condition(&mut new_copy, ConditionType::Terminating);
+
+    if !deep_equal(&old_copy, &new_copy) {
+        enqueue_helper(new_crd, queue);
+    }
+}
+
+// IsProtectedCommunityGroup returns whether or not a group specified for a CRD is protected for the community and needs
+// to have the v1beta1.KubeAPIApprovalAnnotation set.
+pub fn is_protected_community_group(group: &str) -> bool {
+    if group == "k8s.io" || group.ends_with(".k8s.io") {
+        return true;
+    }
+    if group == "kubernetes.io" || group.ends_with(".kubernetes.io") {
+        return true;
+    }
+    false
+}
+
+// APIApprovalState covers the various options for API approval annotation states
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum APIApprovalState {
+    // APIApprovalInvalid means the annotation doesn't have an expected value
+    Invalid,
+    // APIApproved if the annotation has a URL (this means the API is approved)
+    Approved,
+    // APIApprovalBypassed if the annotation starts with "unapproved" indicating that for whatever reason the API isn't approved, but we should allow its creation
+    Bypassed,
+    // APIApprovalMissing means the annotation is empty
+    Missing,
+}
+
+// GetAPIApprovalState returns the state of the API approval and reason for that state
+pub fn get_api_approval_state(annotations: &HashMap<String, String>) -> (APIApprovalState, String) {
+    let annotation = annotations
+        .get(KUBE_API_APPROVED_ANNOTATION)
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    // we use the result of this parsing in the match below
+    let url_parse_result = url::Url::parse(annotation);
+
+    match () {
+        _ if annotation.is_empty() => {
+            return (
+                APIApprovalState::Missing,
+                format!(
+                    "protected groups must have approval annotation \"{}\", see https://github.com/kubernetes/enhancements/pull/1111",
+                    KUBE_API_APPROVED_ANNOTATION
+                ),
+            );
+        }
+        _ if annotation.starts_with("unapproved") => {
+            return (
+                APIApprovalState::Bypassed,
+                format!("not approved: \"{}\"", annotation),
+            );
+        }
+        _ if url_parse_result.is_ok() => {
+            let url = url_parse_result.unwrap();
+            if !url.host_str().unwrap_or("").is_empty() && !url.scheme().is_empty() {
+                return (
+                    APIApprovalState::Approved,
+                    format!("approved in {}", annotation),
                 );
             }
         }
+        _ => {}
     }
 
-    // Next, map the sets of hosts to the sets of ports they offer.
-    // Go does not allow maps or slices as keys to maps, so we have
-    // to synthesize an artificial key and do a sort of 2-part
-    // associative entity.
-    let mut key_to_addr_ready_map: HashMap<String, AddressSet> = HashMap::new();
-    let mut addr_ready_map_key_to_ports: HashMap<String, Vec<EndpointPort>> = HashMap::new();
-
-    for (port, addrs) in port_to_addr_ready_map {
-        let key = hash_addresses(&addrs);
-        key_to_addr_ready_map.insert(key.clone(), addrs);
-        
-        if port.port > 0 {
-            // avoid sentinels
-            addr_ready_map_key_to_ports
-                .entry(key)
-                .or_insert_with(Vec::new)
-                .push(port);
-        } else {
-            // Force it to be present in the map
-            addr_ready_map_key_to_ports.entry(key).or_insert_with(Vec::new);
-        }
-    }
-
-    // Next, build the N-to-M association the API wants.
-    let mut final_subsets = Vec::new();
-    for (key, ports) in addr_ready_map_key_to_ports {
-        let mut ready_addrs = Vec::new();
-        let mut not_ready_addrs = Vec::new();
-
-        if let Some(addr_map) = key_to_addr_ready_map.get(&key) {
-            for (addr_key, ready) in addr_map {
-                if let Some(addr) = all_addrs.get(addr_key) {
-                    if *ready {
-                        ready_addrs.push(addr.clone());
-                    } else {
-                        not_ready_addrs.push(addr.clone());
-                    }
-                }
-            }
-        }
-
-        final_subsets.push(EndpointSubset {
-            addresses: ready_addrs,
-            not_ready_addresses: not_ready_addrs,
-            ports,
-        });
-    }
-
-    // Finally, sort it.
-    sort_subsets(final_subsets)
+    (
+        APIApprovalState::Invalid,
+        format!(
+            "protected groups must have approval annotation \"{}\" with either a URL or a reason starting with \"unapproved\", see https://github.com/kubernetes/enhancements/pull/1111",
+            KUBE_API_APPROVED_ANNOTATION
+        ),
+    )
 }
 
-// The sets of hosts must be de-duped, using IP+UID as the key.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AddressKey {
-    ip: String,
-    uid: String,
-}
-
-type AddressSet = HashMap<AddressKey, bool>;
-
-// mapAddressesByPort adds all ready and not-ready addresses into a map by a single port.
-fn map_addresses_by_port(
-    subset: &EndpointSubset,
-    port: EndpointPort,
-    all_addrs: &mut HashMap<AddressKey, EndpointAddress>,
-    port_to_addr_ready_map: &mut HashMap<EndpointPort, AddressSet>,
+// SetCRDCondition sets the status condition. It either overwrites the existing one or creates a new one.
+pub fn set_crd_condition(
+    crd: &mut CustomResourceDefinition,
+    mut new_condition: CustomResourceDefinitionCondition,
 ) {
-    for addr in &subset.addresses {
-        map_address_by_port(addr, &port, true, all_addrs, port_to_addr_ready_map);
-    }
-    for addr in &subset.not_ready_addresses {
-        map_address_by_port(addr, &port, false, all_addrs, port_to_addr_ready_map);
+    new_condition.last_transition_time = Time::now();
+
+    let existing_condition = find_crd_condition_mut(crd, new_condition.type_);
+
+    if let Some(existing) = existing_condition {
+        if existing.status != new_condition.status || existing.last_transition_time.is_zero() {
+            existing.last_transition_time = new_condition.last_transition_time.clone();
+        }
+
+        existing.status = new_condition.status;
+        existing.reason = new_condition.reason;
+        existing.message = new_condition.message;
+    } else {
+        crd.status.conditions.push(new_condition);
     }
 }
 
-// mapAddressByPort adds one address into a map by port, registering the address with a unique pointer, and preserving
-// any existing ready state.
-fn map_address_by_port(
-    addr: &EndpointAddress,
-    port: &EndpointPort,
-    ready: bool,
-    all_addrs: &mut HashMap<AddressKey, EndpointAddress>,
-    port_to_addr_ready_map: &mut HashMap<EndpointPort, AddressSet>,
-) -> AddressKey {
-    // use addressKey to distinguish between two endpoints that are identical addresses
-    // but may have come from different hosts, for attribution. For instance, Mesos
-    // assigns pods the node IP, but the pods are distinct.
-    let mut key = AddressKey {
-        ip: addr.ip.clone(),
-        uid: String::new(),
-    };
-    if let Some(target_ref) = &addr.target_ref {
-        key.uid = target_ref.uid.clone();
-    }
+// RemoveCRDCondition removes the status condition.
+pub fn remove_crd_condition(
+    crd: &mut CustomResourceDefinition,
+    condition_type: ConditionType,
+) {
+    crd.status
+        .conditions
+        .retain(|condition| condition.type_ != condition_type);
+}
 
-    // Accumulate the address. The full EndpointAddress structure is preserved for use when
-    // we rebuild the subsets so that the final TargetRef has all of the necessary data.
-    if !all_addrs.contains_key(&key) {
-        // Make a copy so we don't write to the
-        // input args of this function.
-        all_addrs.insert(key.clone(), addr.clone());
-    }
+// FindCRDCondition returns the condition you're looking for or nil.
+pub fn find_crd_condition(
+    crd: &CustomResourceDefinition,
+    condition_type: ConditionType,
+) -> Option<&CustomResourceDefinitionCondition> {
+    crd.status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == condition_type)
+}
 
-    // Remember that this port maps to this address.
-    let addr_set = port_to_addr_ready_map
-        .entry(port.clone())
-        .or_insert_with(HashMap::new);
+fn find_crd_condition_mut(
+    crd: &mut CustomResourceDefinition,
+    condition_type: ConditionType,
+) -> Option<&mut CustomResourceDefinitionCondition> {
+    crd.status
+        .conditions
+        .iter_mut()
+        .find(|condition| condition.type_ == condition_type)
+}
 
-    // if we have not yet recorded this port for this address, or if the previous
-    // state was ready, write the current ready state. not ready always trumps
-    // ready.
-    if let Some(&was_ready) = addr_set.get(&key) {
-        if was_ready {
-            addr_set.insert(key.clone(), ready);
+// IsCRDConditionTrue indicates if the condition is present and strictly true.
+pub fn is_crd_condition_true(
+    crd: &CustomResourceDefinition,
+    condition_type: ConditionType,
+) -> bool {
+    is_crd_condition_present_and_equal(crd, condition_type, ConditionStatus::True)
+}
+
+// IsCRDConditionFalse indicates if the condition is present and false.
+pub fn is_crd_condition_false(
+    crd: &CustomResourceDefinition,
+    condition_type: ConditionType,
+) -> bool {
+    is_crd_condition_present_and_equal(crd, condition_type, ConditionStatus::False)
+}
+
+// IsCRDConditionPresentAndEqual indicates if the condition is present and equal to the given status.
+pub fn is_crd_condition_present_and_equal(
+    crd: &CustomResourceDefinition,
+    condition_type: ConditionType,
+    status: ConditionStatus,
+) -> bool {
+    crd.status
+        .conditions
+        .iter()
+        .any(|condition| condition.type_ == condition_type && condition.status == status)
+}
+
+// IsCRDConditionEquivalent returns true if the lhs and rhs are equivalent except for times.
+pub fn is_crd_condition_equivalent(
+    lhs: Option<&CustomResourceDefinitionCondition>,
+    rhs: Option<&CustomResourceDefinitionCondition>,
+) -> bool {
+    match (lhs, rhs) {
+        (None, None) => true,
+        (None, Some(_)) | (Some(_), None) => false,
+        (Some(l), Some(r)) => {
+            l.message == r.message
+                && l.reason == r.reason
+                && l.status == r.status
+                && l.type_ == r.type_
         }
-    } else {
-        addr_set.insert(key.clone(), ready);
     }
+}
 
-    key
+// CRDHasFinalizer returns true if the finalizer is in the list.
+pub fn crd_has_finalizer(crd: &CustomResourceDefinition, needle: &str) -> bool {
+    crd.finalizers.iter().any(|finalizer| finalizer == needle)
+}
+
+// CRDRemoveFinalizer removes the finalizer if present.
+pub fn crd_remove_finalizer(crd: &mut CustomResourceDefinition, needle: &str) {
+    crd.finalizers.retain(|finalizer| finalizer != needle);
+}
+
+// HasServedCRDVersion returns true if the given version is in the list of CRD's versions and the Served flag is set.
+pub fn has_served_crd_version(crd: &CustomResourceDefinition, version: &str) -> bool {
+    crd.spec
+        .versions
+        .iter()
+        .any(|v| v.name == version && v.served)
+}
+
+// GetCRDStorageVersion returns the storage version for given CRD.
+pub fn get_crd_storage_version(
+    crd: &CustomResourceDefinition,
+) -> Result<String, Box<dyn std::error::Error>> {
+    for v in &crd.spec.versions {
+        if v.storage {
+            return Ok(v.name.clone());
+        }
+    }
+    // This should not happened if crd is valid
+    Err("invalid apiextensionsv1.CustomResourceDefinition, no storage version".into())
+}
+
+// GetSchemaForVersion returns the validation schema for the given version or nil.
+pub fn get_schema_for_version(
+    crd: &CustomResourceDefinition,
+    version: &str,
+) -> Result<Option<CustomResourceValidation>, Box<dyn std::error::Error>> {
+    for v in &crd.spec.versions {
+        if version == v.name {
+            return Ok(v.schema.clone());
+        }
+    }
+    Err(format!(
+        "version {} not found in apiextensionsv1.CustomResourceDefinition: {}",
+        version, crd.name
+    )
+    .into())
+}
+
+// GetSubresourcesForVersion returns the subresources for given version or nil.
+pub fn get_subresources_for_version(
+    crd: &CustomResourceDefinition,
+    version: &str,
+) -> Result<Option<CustomResourceSubresources>, Box<dyn std::error::Error>> {
+    for v in &crd.spec.versions {
+        if version == v.name {
+            return Ok(v.subresources.clone());
+        }
+    }
+    Err(format!(
+        "version {} not found in apiextensionsv1.CustomResourceDefinition: {}",
+        version, crd.name
+    )
+    .into())
+}
+
+// Helper types and functions (these would need to be implemented based on your actual types)
+
+#[derive(Debug, Clone)]
+pub struct CustomResourceDefinition {
+    pub name: String,
+    pub resource_version: String,
+    pub deletion_timestamp: Time,
+    pub finalizers: Vec<String>,
+    pub spec: CustomResourceDefinitionSpec,
+    pub status: CustomResourceDefinitionStatus,
+}
+
+impl CustomResourceDefinition {
+    pub fn deep_copy(&self) -> Self {
+        self.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
-struct AddrReady {
-    addr_key: AddressKey,
-    ready: bool,
+pub struct CustomResourceDefinitionSpec {
+    pub group: String,
+    pub names: CustomResourceDefinitionNames,
+    pub versions: Vec<CustomResourceDefinitionVersion>,
 }
 
-fn hash_addresses(addrs: &AddressSet) -> String {
-    // Flatten the list of addresses into a string so it can be used as a
-    // map key.  Unfortunately, DeepHashObject is implemented in terms of
-    // spew, and spew does not handle non-primitive map keys well.  So
-    // first we collapse it into a slice, sort the slice, then hash that.
-    let mut slice: Vec<AddrReady> = addrs
-        .iter()
-        .map(|(k, &ready)| AddrReady {
-            addr_key: k.clone(),
-            ready,
-        })
-        .collect();
-
-    slice.sort_by(|a, b| less_addr_ready(a, b));
-
-    let mut hasher = Md5::new();
-    deep_hash_object(&mut hasher, &slice);
-    let result = hasher.finalize();
-    hex::encode(&result[..])
+#[derive(Debug, Clone)]
+pub struct CustomResourceDefinitionNames {
+    pub plural: String,
 }
 
-fn less_addr_ready(a: &AddrReady, b: &AddrReady) -> Ordering {
-    // ready is not significant to hashing since we can't have duplicate addresses
-    less_endpoint_address_key(&a.addr_key, &b.addr_key)
+#[derive(Debug, Clone)]
+pub struct CustomResourceDefinitionVersion {
+    pub name: String,
+    pub served: bool,
+    pub storage: bool,
+    pub schema: Option<CustomResourceValidation>,
+    pub subresources: Option<CustomResourceSubresources>,
 }
 
-// LessEndpointAddress compares IP addresses lexicographically and returns true if first argument is lesser than second
-fn less_endpoint_address(a: &EndpointAddress, b: &EndpointAddress) -> Ordering {
-    let ip_comparison = a.ip.as_bytes().cmp(b.ip.as_bytes());
-    if ip_comparison != Ordering::Equal {
-        return ip_comparison;
+#[derive(Debug, Clone)]
+pub struct CustomResourceDefinitionStatus {
+    pub conditions: Vec<CustomResourceDefinitionCondition>,
+    pub accepted_names: CustomResourceDefinitionNames,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomResourceDefinitionCondition {
+    pub type_: ConditionType,
+    pub status: ConditionStatus,
+    pub reason: String,
+    pub message: String,
+    pub last_transition_time: Time,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionType {
+    Terminating,
+    Established,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionStatus {
+    True,
+    False,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct Time {
+    // Implementation details
+}
+
+impl Time {
+    pub fn now() -> Self {
+        Time {}
     }
 
-    match (&a.target_ref, &b.target_ref) {
-        (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (Some(a_ref), Some(b_ref)) => a_ref.uid.cmp(&b_ref.uid),
+    pub fn is_zero(&self) -> bool {
+        false
     }
 }
 
-fn less_endpoint_address_key(a: &AddressKey, b: &AddressKey) -> Ordering {
-    let ip_comparison = a.ip.as_bytes().cmp(b.ip.as_bytes());
-    if ip_comparison != Ordering::Equal {
-        return ip_comparison;
-    }
-    a.uid.cmp(&b.uid)
+#[derive(Debug, Clone)]
+pub struct CustomResourceValidation {
+    // Implementation details
 }
 
-// SortSubsets sorts an array of EndpointSubset objects in place.  For ease of
-// use it returns the input slice.
-fn sort_subsets(mut subsets: Vec<EndpointSubset>) -> Vec<EndpointSubset> {
-    for subset in &mut subsets {
-        subset.addresses.sort_by(less_endpoint_address);
-        subset.not_ready_addresses.sort_by(less_endpoint_address);
-        subset.ports.sort_by(|a, b| {
-            let h1 = hash_object_port(a);
-            let h2 = hash_object_port(b);
-            h1.cmp(&h2)
+#[derive(Debug, Clone)]
+pub struct CustomResourceSubresources {
+    // Implementation details
+}
+
+#[derive(Debug, Clone)]
+pub struct Context {
+    // Implementation details
+}
+
+impl Context {
+    pub fn todo() -> Self {
+        Context {}
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    // Implementation details
+}
+
+#[derive(Debug, Clone)]
+pub struct ListOptions {
+    // Implementation details
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteOptions {
+    // Implementation details
+}
+
+#[derive(Debug)]
+pub struct UnstructuredList {
+    pub items: Vec<Unstructured>,
+}
+
+#[derive(Debug)]
+pub struct Unstructured {
+    // Implementation details
+}
+
+pub struct ResourceEventHandlerFuncs {
+    pub add_func: Box<dyn Fn(Box<dyn std::any::Any>) + Send + Sync>,
+    pub update_func: Box<dyn Fn(Box<dyn std::any::Any>, Box<dyn std::any::Any>) + Send + Sync>,
+}
+
+pub trait CustomResourceDefinitionInformer: Send + Sync {
+    fn lister(&self) -> Arc<dyn CustomResourceDefinitionLister>;
+    fn informer(&self) -> Arc<dyn Informer>;
+}
+
+pub trait Informer: Send + Sync {
+    fn has_synced(&self) -> Arc<dyn Fn() -> bool + Send + Sync>;
+    fn add_event_handler(&self, handler: ResourceEventHandlerFuncs);
+}
+
+pub type ValidateAllObjectFunc = fn() -> bool;
+
+const CUSTOM_RESOURCE_CLEANUP_FINALIZER: &str = "customresourcecleanup.apiextensions.k8s.io";
+const KUBE_API_APPROVED_ANNOTATION: &str = "api-approved.kubernetes.io";
+
+// Stub implementations for helper functions
+fn is_not_found(_err: &Box<dyn std::error::Error>) -> bool {
+    false
+}
+
+fn is_conflict(_err: &Box<dyn std::error::Error>) -> bool {
+    false
+}
+
+fn handle_error(_err: Box<dyn std::error::Error>) {}
+
+fn new_context() -> Context {
+    Context {}
+}
+
+fn with_namespace(ctx: Context, _namespace: &str) -> Context {
+    ctx
+}
+
+fn get_accessor(_item: &Unstructured) -> Result<Metadata, Box<dyn std::error::Error>> {
+    Ok(Metadata {})
+}
+
+struct Metadata {}
+
+impl Metadata {
+    fn get_namespace(&self) -> String {
+        String::new()
+    }
+}
+
+fn validate_all_object_func() -> bool {
+    true
+}
+
+fn aggregate_errors(_errors: Vec<Box<dyn std::error::Error>>) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::new(std::io::ErrorKind::Other, "aggregate error"))
+}
+
+fn poll_until_context_timeout<F>(
+    _ctx: Context,
+    _interval: Duration,
+    _timeout: Duration,
+    _immediate: bool,
+    _condition: F,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: Fn(Context) -> Result<bool, Box<dyn std::error::Error>>,
+{
+    Ok(())
+}
+
+fn log_v2(_msg: &str) {}
+
+fn log_info(_msg: &str) {}
+
+fn defer_handle_crash() {}
+
+fn defer_shutdown(_queue: &Arc<dyn TypedRateLimitingQueue<String>>) {}
+
+fn defer_log_info(_msg: &str) {}
+
+fn wait_for_cache_sync(
+    _stop_ch: tokio::sync::broadcast::Receiver<()>,
+    _synced: &Arc<dyn Fn() -> bool + Send + Sync>,
+) -> bool {
+    true
+}
+
+fn wait_until<F>(
+    _worker: F,
+    _period: Duration,
+    _stop_ch: tokio::sync::broadcast::Receiver<()>,
+)
+where
+    F: Fn(),
+{
+}
+
+fn deletion_handling_meta_namespace_key_func(
+    _obj: &CustomResourceDefinition,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(String::new())
+}
+
+fn enqueue_helper(
+    _obj: &CustomResourceDefinition,
+    _queue: Arc<dyn TypedRateLimitingQueue<String>>,
+) {
+}
+
+fn deep_equal(_a: &CustomResourceDefinition, _b: &CustomResourceDefinition) -> bool {
+    false
+}
+
+fn create_typed_rate_limiting_queue(
+    _name: &str,
+) -> Arc<dyn TypedRateLimitingQueue<String>> {
+    unimplemented!()
+}
+
+==========================================================================================
+
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+
+// This controller is reserving names. To avoid conflicts, be sure to run only one instance of the worker at a time.
+// This could eventually be lifted, but starting simple.
+pub struct NamingConditionController {
+    crd_client: Arc<dyn CustomResourceDefinitionsGetter>,
+    crd_lister: Arc<dyn CustomResourceDefinitionLister>,
+    crd_synced: Arc<dyn Fn() -> bool + Send + Sync>,
+    // crdMutationCache backs our lister and keeps track of committed updates to avoid racy
+    // write/lookup cycles. It's got 100 slots by default, so it unlikely to overrun
+    // TODO to revisit this if naming conflicts are found to occur in the wild
+    crd_mutation_cache: Arc<dyn MutationCache>,
+    // To allow injection for testing.
+    sync_fn: Box<dyn Fn(&str) -> Result<(), Box<dyn std::error::Error>> + Send + Sync>,
+    queue: Arc<dyn TypedRateLimitingQueue<String>>,
+}
+
+pub fn new_naming_condition_controller(
+    logger: Logger,
+    crd_informer: Arc<dyn CustomResourceDefinitionInformer>,
+    crd_client: Arc<dyn CustomResourceDefinitionsGetter>,
+) -> NamingConditionController {
+    let crd_lister = crd_informer.lister();
+    let crd_synced = crd_informer.informer().has_synced();
+    let queue = create_typed_rate_limiting_queue_with_config(
+        default_typed_controller_rate_limiter(),
+        TypedRateLimitingQueueConfig {
+            name: "crd_naming_condition_controller".to_string(),
+        },
+    );
+
+    let informer_indexer = crd_informer.informer().get_indexer();
+    let crd_mutation_cache = new_integer_resource_version_mutation_cache(
+        logger.clone(),
+        informer_indexer.clone(),
+        informer_indexer.clone(),
+        Duration::from_secs(60),
+        false,
+    );
+
+    let queue_clone = queue.clone();
+    crd_informer.informer().add_event_handler_with_options(
+        ResourceEventHandlerFuncs {
+            add_func: Box::new(move |obj| {
+                add_custom_resource_definition(obj, queue_clone.clone())
+            }),
+            update_func: Box::new(move |obj, _| {
+                update_custom_resource_definition(obj, queue_clone.clone())
+            }),
+            delete_func: Box::new(move |obj| {
+                delete_custom_resource_definition(obj, queue_clone.clone())
+            }),
+        },
+        HandlerOptions { logger },
+    );
+
+    let mut c = NamingConditionController {
+        crd_client,
+        crd_lister,
+        crd_synced,
+        crd_mutation_cache,
+        sync_fn: Box::new(|_| Ok(())), // placeholder
+        queue,
+    };
+
+    // Set sync_fn after construction
+    // Note: In Rust, we can't easily reference self in the constructor,
+    // so this would need to be refactored or use Arc/Mutex pattern
+    c
+}
+
+impl NamingConditionController {
+    fn get_accepted_names_for_group(&self, group: &str) -> (HashSet<String>, HashSet<String>) {
+        let mut all_resources = HashSet::new();
+        let mut all_kinds = HashSet::new();
+
+        let list = match self.crd_lister.list(labels_everything()) {
+            Ok(list) => list,
+            Err(err) => panic!("{:?}", err),
+        };
+
+        for curr in list {
+            if curr.spec.group != group {
+                continue;
+            }
+
+            // for each item here, see if we have a mutation cache entry that is more recent
+            // this makes sure that if we tight loop on update and run, our mutation cache will show
+            // us the version of the objects we just updated to.
+            let item = if let Ok(Some(obj)) = self.crd_mutation_cache.get_by_key(&curr.name) {
+                obj.downcast_ref::<CustomResourceDefinition>()
+                    .unwrap()
+                    .clone()
+            } else {
+                curr
+            };
+
+            all_resources.insert(item.status.accepted_names.plural.clone());
+            all_resources.insert(item.status.accepted_names.singular.clone());
+            for short_name in &item.status.accepted_names.short_names {
+                all_resources.insert(short_name.clone());
+            }
+
+            all_kinds.insert(item.status.accepted_names.kind.clone());
+            all_kinds.insert(item.status.accepted_names.list_kind.clone());
+        }
+
+        (all_resources, all_kinds)
+    }
+
+    fn calculate_names_and_conditions(
+        &self,
+        input: &CustomResourceDefinition,
+    ) -> (
+        CustomResourceDefinitionNames,
+        CustomResourceDefinitionCondition,
+        CustomResourceDefinitionCondition,
+    ) {
+        // Get the names that have already been claimed
+        let (all_resources, all_kinds) = self.get_accepted_names_for_group(&input.spec.group);
+
+        let mut names_accepted_condition = CustomResourceDefinitionCondition {
+            type_: ConditionType::NamesAccepted,
+            status: ConditionStatus::Unknown,
+            reason: String::new(),
+            message: String::new(),
+            last_transition_time: Time::now(),
+        };
+
+        let requested_names = &input.spec.names;
+        let accepted_names = &input.status.accepted_names;
+        let mut new_names = input.status.accepted_names.clone();
+
+        // Check each name for mismatches. If there's a mismatch between spec and status, then try to deconflict.
+        // Continue on errors so that the status is the best match possible
+        if let Err(err) = equal_to_accepted_or_fresh(
+            &requested_names.plural,
+            &accepted_names.plural,
+            &all_resources,
+        ) {
+            names_accepted_condition.status = ConditionStatus::False;
+            names_accepted_condition.reason = "PluralConflict".to_string();
+            names_accepted_condition.message = err.to_string();
+        } else {
+            new_names.plural = requested_names.plural.clone();
+        }
+
+        if let Err(err) = equal_to_accepted_or_fresh(
+            &requested_names.singular,
+            &accepted_names.singular,
+            &all_resources,
+        ) {
+            names_accepted_condition.status = ConditionStatus::False;
+            names_accepted_condition.reason = "SingularConflict".to_string();
+            names_accepted_condition.message = err.to_string();
+        } else {
+            new_names.singular = requested_names.singular.clone();
+        }
+
+        if requested_names.short_names != accepted_names.short_names {
+            let mut errs = Vec::new();
+            let existing_short_names: HashSet<String> =
+                accepted_names.short_names.iter().cloned().collect();
+
+            for short_name in &requested_names.short_names {
+                // if the shortname is already ours, then we're fine
+                if existing_short_names.contains(short_name) {
+                    continue;
+                }
+                if let Err(err) = equal_to_accepted_or_fresh(short_name, "", &all_resources) {
+                    errs.push(err);
+                }
+            }
+
+            if !errs.is_empty() {
+                let aggregate_err = new_aggregate(errs);
+                names_accepted_condition.status = ConditionStatus::False;
+                names_accepted_condition.reason = "ShortNamesConflict".to_string();
+                names_accepted_condition.message = aggregate_err.to_string();
+            } else {
+                new_names.short_names = requested_names.short_names.clone();
+            }
+        }
+
+        if let Err(err) =
+            equal_to_accepted_or_fresh(&requested_names.kind, &accepted_names.kind, &all_kinds)
+        {
+            names_accepted_condition.status = ConditionStatus::False;
+            names_accepted_condition.reason = "KindConflict".to_string();
+            names_accepted_condition.message = err.to_string();
+        } else {
+            new_names.kind = requested_names.kind.clone();
+        }
+
+        if let Err(err) = equal_to_accepted_or_fresh(
+            &requested_names.list_kind,
+            &accepted_names.list_kind,
+            &all_kinds,
+        ) {
+            names_accepted_condition.status = ConditionStatus::False;
+            names_accepted_condition.reason = "ListKindConflict".to_string();
+            names_accepted_condition.message = err.to_string();
+        } else {
+            new_names.list_kind = requested_names.list_kind.clone();
+        }
+
+        new_names.categories = requested_names.categories.clone();
+
+        // if we haven't changed the condition, then our names must be good.
+        if names_accepted_condition.status == ConditionStatus::Unknown {
+            names_accepted_condition.status = ConditionStatus::True;
+            names_accepted_condition.reason = "NoConflicts".to_string();
+            names_accepted_condition.message = "no conflicts found".to_string();
+        }
+
+        // set EstablishedCondition initially to false, then set it to true in establishing controller.
+        // The Establishing Controller will see the NamesAccepted condition when it arrives through the shared informer.
+        // At that time the API endpoint handler will serve the endpoint, avoiding a race
+        // which we had if we set Established to true here.
+        let mut established_condition = CustomResourceDefinitionCondition {
+            type_: ConditionType::Established,
+            status: ConditionStatus::False,
+            reason: "NotAccepted".to_string(),
+            message: "not all names are accepted".to_string(),
+            last_transition_time: Time::now(),
+        };
+
+        if let Some(old) = find_crd_condition(input, ConditionType::Established) {
+            established_condition = old.clone();
+        }
+
+        if established_condition.status != ConditionStatus::True
+            && names_accepted_condition.status == ConditionStatus::True
+        {
+            established_condition = CustomResourceDefinitionCondition {
+                type_: ConditionType::Established,
+                status: ConditionStatus::False,
+                reason: "Installing".to_string(),
+                message: "the initial names have been accepted".to_string(),
+                last_transition_time: Time::now(),
+            };
+        }
+
+        (new_names, names_accepted_condition, established_condition)
+    }
+
+    fn sync(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let in_custom_resource_definition = match self.crd_lister.get(key) {
+            Ok(crd) => crd,
+            Err(err) if is_not_found(&err) => {
+                // CRD was deleted and has freed its names.
+                // Reconsider all other CRDs in the same group.
+                self.requeue_all_other_group_crds(key)?;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+
+        // Skip checking names if Spec and Status names are same.
+        if semantic_deep_equal(
+            &in_custom_resource_definition.spec.names,
+            &in_custom_resource_definition.status.accepted_names,
+        ) {
+            return Ok(());
+        }
+
+        let (accepted_names, naming_condition, established_condition) =
+            self.calculate_names_and_conditions(&in_custom_resource_definition);
+
+        // nothing to do if accepted names and NamesAccepted condition didn't change
+        if deep_equal(
+            &in_custom_resource_definition.status.accepted_names,
+            &accepted_names,
+        ) && is_crd_condition_equivalent(
+            Some(&naming_condition),
+            find_crd_condition(
+                &in_custom_resource_definition,
+                ConditionType::NamesAccepted,
+            ),
+        ) {
+            return Ok(());
+        }
+
+        let mut crd = in_custom_resource_definition.deep_copy();
+        crd.status.accepted_names = accepted_names;
+        set_crd_condition(&mut crd, naming_condition);
+        set_crd_condition(&mut crd, established_condition);
+
+        let updated_obj = match self
+            .crd_client
+            .custom_resource_definitions()
+            .update_status(Context::todo(), &crd, UpdateOptions::default())
+        {
+            Ok(obj) => obj,
+            Err(err) if is_not_found(&err) || is_conflict(&err) => {
+                // deleted or changed in the meantime, we'll get called again
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+
+        // if the update was successful, go ahead and add the entry to the mutation cache
+        self.crd_mutation_cache.mutation(&updated_obj);
+
+        // we updated our status, so we may be releasing a name. When this happens, we need to rekick everything in our group
+        // if we fail to rekick, just return as normal. We'll get everything on a resync
+        if let Err(err) = self.requeue_all_other_group_crds(key) {
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    pub fn run(&self, stop_ch: tokio::sync::broadcast::Receiver<()>) {
+        defer_handle_crash();
+        defer_shutdown(&self.queue);
+
+        log_info("Starting NamingConditionController");
+        defer_log_info("Shutting down NamingConditionController");
+
+        if !wait_for_cache_sync(stop_ch.resubscribe(), &self.crd_synced) {
+            return;
+        }
+
+        // only start one worker thread since its a slow moving API and the naming conflict resolution bits aren't thread-safe
+        let worker = self.clone();
+        tokio::spawn(async move {
+            wait_until(
+                || worker.run_worker(),
+                Duration::from_secs(1),
+                stop_ch.resubscribe(),
+            );
         });
+
+        let _ = stop_ch.recv();
     }
 
-    subsets.sort_by(|a, b| {
-        let h1 = hash_object_subset(a);
-        let h2 = hash_object_subset(b);
-        h1.cmp(&h2)
-    });
+    fn run_worker(&self) {
+        while self.process_next_work_item() {}
+    }
 
-    subsets
+    // processNextWorkItem deals with one key off the queue. It returns false when it's time to quit.
+    fn process_next_work_item(&self) -> bool {
+        let (key, quit) = self.queue.get();
+        if quit {
+            return false;
+        }
+
+        let result = (self.sync_fn)(&key);
+
+        self.queue.done(key.clone());
+
+        match result {
+            Ok(_) => {
+                self.queue.forget(key);
+                true
+            }
+            Err(err) => {
+                handle_error(Box::new(format!("{} failed with: {:?}", key, err)));
+                self.queue.add_rate_limited(key);
+                true
+            }
+        }
+    }
+
+    fn enqueue(&self, obj: &CustomResourceDefinition) {
+        let key = match deletion_handling_meta_namespace_key_func(obj) {
+            Ok(k) => k,
+            Err(err) => {
+                handle_error(Box::new(format!(
+                    "couldn't get key for object {:?}: {:?}",
+                    obj, err
+                )));
+                return;
+            }
+        };
+
+        self.queue.add(key);
+    }
+
+    fn requeue_all_other_group_crds(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let plural_group: Vec<&str> = name.splitn(2, '.').collect();
+        let list = self.crd_lister.list(labels_everything())?;
+
+        for curr in list {
+            if plural_group.len() > 1
+                && curr.spec.group == plural_group[1]
+                && curr.name != name
+            {
+                self.queue.add(curr.name.clone());
+            }
+        }
+
+        Ok(())
+    }
 }
 
-fn hash_object_subset(obj: &EndpointSubset) -> Vec<u8> {
-    let mut hasher = Md5::new();
-    deep_hash_object(&mut hasher, obj);
-    hasher.finalize().to_vec()
+fn equal_to_accepted_or_fresh(
+    requested_name: &str,
+    accepted_name: &str,
+    used_names: &HashSet<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if requested_name == accepted_name {
+        return Ok(());
+    }
+    if !used_names.contains(requested_name) {
+        return Ok(());
+    }
+
+    Err(format!("\"{}\" is already in use", requested_name).into())
 }
 
-fn hash_object_port(obj: &EndpointPort) -> Vec<u8> {
-    let mut hasher = Md5::new();
-    deep_hash_object(&mut hasher, obj);
-    hasher.finalize().to_vec()
+fn add_custom_resource_definition(
+    obj: Box<dyn std::any::Any>,
+    queue: Arc<dyn TypedRateLimitingQueue<String>>,
+) {
+    let cast_obj = obj.downcast_ref::<CustomResourceDefinition>().unwrap();
+    log_v4(&format!("Adding {}", cast_obj.name));
+    enqueue_helper(cast_obj, queue);
 }
 
-// Placeholder for deep hash function - would need proper implementation
-// based on your serialization requirements
-fn deep_hash_object<T: std::fmt::Debug>(hasher: &mut Md5, obj: &T) {
-    let debug_str = format!("{:?}", obj);
-    hasher.update(debug_str.as_bytes());
+fn update_custom_resource_definition(
+    obj: Box<dyn std::any::Any>,
+    queue: Arc<dyn TypedRateLimitingQueue<String>>,
+) {
+    let cast_obj = obj.downcast_ref::<CustomResourceDefinition>().unwrap();
+    log_v4(&format!("Updating {}", cast_obj.name));
+    enqueue_helper(cast_obj, queue);
 }
 
-// Helper types that would need to be defined based on your Kubernetes types
+fn delete_custom_resource_definition(
+    obj: Box<dyn std::any::Any>,
+    queue: Arc<dyn TypedRateLimitingQueue<String>>,
+) {
+    let cast_obj = if let Some(crd) = obj.downcast_ref::<CustomResourceDefinition>() {
+        crd
+    } else if let Some(tombstone) = obj.downcast_ref::<DeletedFinalStateUnknown>() {
+        if let Some(crd) = tombstone.obj.downcast_ref::<CustomResourceDefinition>() {
+            crd
+        } else {
+            log_error(&format!(
+                "Tombstone contained object that is not expected {:?}",
+                obj
+            ));
+            return;
+        }
+    } else {
+        log_error(&format!("Couldn't get object from tombstone {:?}", obj));
+        return;
+    };
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-struct EndpointPort {
-    port: i32,
-    name: String,
-    protocol: String,
+    log_v4(&format!("Deleting \"{}\"", cast_obj.name));
+    enqueue_helper(cast_obj, queue);
 }
 
-#[derive(Clone, Debug, Default)]
-struct EndpointAddress {
-    ip: String,
-    node_name: Option<String>,
-    target_ref: Option<ObjectReference>,
+// Helper types and functions
+
+#[derive(Debug, Clone)]
+pub struct CustomResourceDefinition {
+    pub name: String,
+    pub spec: CustomResourceDefinitionSpec,
+    pub status: CustomResourceDefinitionStatus,
 }
 
-#[derive(Clone, Debug)]
-struct EndpointSubset {
-    addresses: Vec<EndpointAddress>,
-    not_ready_addresses: Vec<EndpointAddress>,
-    ports: Vec<EndpointPort>,
+impl CustomResourceDefinition {
+    pub fn deep_copy(&self) -> Self {
+        self.clone()
+    }
 }
 
-#[derive(Clone, Debug)]
-struct ObjectReference {
-    uid: String,
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomResourceDefinitionSpec {
+    pub group: String,
+    pub names: CustomResourceDefinitionNames,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CustomResourceDefinitionNames {
+    pub plural: String,
+    pub singular: String,
+    pub short_names: Vec<String>,
+    pub kind: String,
+    pub list_kind: String,
+    pub categories: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomResourceDefinitionStatus {
+    pub accepted_names: CustomResourceDefinitionNames,
+    pub conditions: Vec<CustomResourceDefinitionCondition>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomResourceDefinitionCondition {
+    pub type_: ConditionType,
+    pub status: ConditionStatus,
+    pub reason: String,
+    pub message: String,
+    pub last_transition_time: Time,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionType {
+    NamesAccepted,
+    Established,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionStatus {
+    True,
+    False,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct Time {}
+
+impl Time {
+    pub fn now() -> Self {
+        Time {}
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Context {}
+
+impl Context {
+    pub fn todo() -> Self {
+        Context {}
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {}
+
+#[derive(Debug, Clone)]
+pub struct Logger {}
+
+#[derive(Debug)]
+pub struct DeletedFinalStateUnknown {
+    pub obj: Box<dyn std::any::Any>,
+}
+
+pub struct ResourceEventHandlerFuncs {
+    pub add_func: Box<dyn Fn(Box<dyn std::any::Any>) + Send + Sync>,
+    pub update_func: Box<dyn Fn(Box<dyn std::any::Any>, Box<dyn std::any::Any>) + Send + Sync>,
+    pub delete_func: Box<dyn Fn(Box<dyn std::any::Any>) + Send + Sync>,
+}
+
+pub struct HandlerOptions {
+    pub logger: Logger,
+}
+
+pub struct TypedRateLimitingQueueConfig {
+    pub name: String,
+}
+
+pub trait TypedRateLimitingQueue<T>: Send + Sync {
+    fn add(&self, item: T);
+    fn get(&self) -> (T, bool);
+    fn done(&self, item: T);
+    fn forget(&self, item: T);
+    fn add_rate_limited(&self, item: T);
+    fn shut_down(&self);
+}
+
+pub trait CustomResourceDefinitionsGetter: Send + Sync {
+    fn custom_resource_definitions(&self) -> Arc<dyn CustomResourceDefinitionInterface>;
+}
+
+pub trait CustomResourceDefinitionInterface: Send + Sync {
+    fn update_status(
+        &self,
+        ctx: Context,
+        crd: &CustomResourceDefinition,
+        options: UpdateOptions,
+    ) -> Result<CustomResourceDefinition, Box<dyn std::error::Error>>;
+}
+
+pub trait CustomResourceDefinitionLister: Send + Sync {
+    fn get(&self, name: &str) -> Result<CustomResourceDefinition, Box<dyn std::error::Error>>;
+    fn list(
+        &self,
+        selector: LabelSelector,
+    ) -> Result<Vec<CustomResourceDefinition>, Box<dyn std::error::Error>>;
+}
+
+pub trait CustomResourceDefinitionInformer: Send + Sync {
+    fn lister(&self) -> Arc<dyn CustomResourceDefinitionLister>;
+    fn informer(&self) -> Arc<dyn Informer>;
+}
+
+pub trait Informer: Send + Sync {
+    fn has_synced(&self) -> Arc<dyn Fn() -> bool + Send + Sync>;
+    fn get_indexer(&self) -> Arc<dyn Indexer>;
+    fn add_event_handler_with_options(
+        &self,
+        handler: ResourceEventHandlerFuncs,
+        options: HandlerOptions,
+    );
+}
+
+pub trait Indexer: Send + Sync {}
+
+pub trait MutationCache: Send + Sync {
+    fn get_by_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<Box<dyn std::any::Any>>, Box<dyn std::error::Error>>;
+    fn mutation(&self, obj: &CustomResourceDefinition);
+}
+
+#[derive(Debug, Clone)]
+pub struct LabelSelector {}
+
+// Stub implementations
+fn labels_everything() -> LabelSelector {
+    LabelSelector {}
+}
+
+fn is_not_found(_err: &Box<dyn std::error::Error>) -> bool {
+    false
+}
+
+fn is_conflict(_err: &Box<dyn std::error::Error>) -> bool {
+    false
+}
+
+fn semantic_deep_equal<T>(_a: &T, _b: &T) -> bool {
+    false
+}
+
+fn deep_equal<T>(_a: &T, _b: &T) -> bool {
+    false
+}
+
+fn find_crd_condition(
+    _crd: &CustomResourceDefinition,
+    _condition_type: ConditionType,
+) -> Option<&CustomResourceDefinitionCondition> {
+    None
+}
+
+fn is_crd_condition_equivalent(
+    _lhs: Option<&CustomResourceDefinitionCondition>,
+    _rhs: Option<&CustomResourceDefinitionCondition>,
+) -> bool {
+    false
+}
+
+fn set_crd_condition(_crd: &mut CustomResourceDefinition, _condition: CustomResourceDefinitionCondition) {}
+
+fn handle_error(_err: Box<dyn std::error::Error>) {}
+
+fn defer_handle_crash() {}
+
+fn defer_shutdown(_queue: &Arc<dyn TypedRateLimitingQueue<String>>) {}
+
+fn log_info(_msg: &str) {}
+
+fn defer_log_info(_msg: &str) {}
+
+fn log_v4(_msg: &str) {}
+
+fn log_error(_msg: &str) {}
+
+fn wait_for_cache_sync(
+    _stop_ch: tokio::sync::broadcast::Receiver<()>,
+    _synced: &Arc<dyn Fn() -> bool + Send + Sync>,
+) -> bool {
+    true
+}
+
+fn wait_until<F>(
+    _worker: F,
+    _period: Duration,
+    _stop_ch: tokio::sync::broadcast::Receiver<()>,
+)
+where
+    F: Fn(),
+{
+}
+
+fn deletion_handling_meta_namespace_key_func(
+    _obj: &CustomResourceDefinition,
+) -> Result<String, Box<dyn std::error::Error>> {
+    Ok(String::new())
+}
+
+fn enqueue_helper(_obj: &CustomResourceDefinition, _queue: Arc<dyn TypedRateLimitingQueue<String>>) {}
+
+fn new_aggregate(_errs: Vec<Box<dyn std::error::Error>>) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        "aggregate error",
+    ))
+}
+
+fn create_typed_rate_limiting_queue_with_config(
+    _limiter: RateLimiter,
+    _config: TypedRateLimitingQueueConfig,
+) -> Arc<dyn TypedRateLimitingQueue<String>> {
+    unimplemented!()
+}
+
+fn default_typed_controller_rate_limiter() -> RateLimiter {
+    RateLimiter {}
+}
+
+fn new_integer_resource_version_mutation_cache(
+    _logger: Logger,
+    _lister: Arc<dyn Indexer>,
+    _indexer: Arc<dyn Indexer>,
+    _ttl: Duration,
+    _compare: bool,
+) -> Arc<dyn MutationCache> {
+    unimplemented!()
+}
+
+pub struct RateLimiter {}
+
