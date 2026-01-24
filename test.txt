@@ -1,102 +1,14 @@
-use std::collections::HashMap;
-
-lazy_static! {
-    static ref INT_OR_STRING_ANY_OF: Vec<NestedValueValidation> = vec![
-        NestedValueValidation {
-            forbidden_generics: Generic {
-                type_: "integer".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-        NestedValueValidation {
-            forbidden_generics: Generic {
-                type_: "string".to_string(),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    ];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Level {
-    Root = 0,
-    Item = 1,
-    Field = 2,
-}
-
-#[derive(Debug, Clone)]
-struct ValidationOptions {
-    /// AllowNestedAdditionalProperties allows additionalProperties to be specified in
-    /// nested contexts (allOf, anyOf, oneOf, not).
-    allow_nested_additional_properties: bool,
-
-    /// AllowNestedXValidations allows x-kubernetes-validations to be specified in
-    /// nested contexts (allOf, anyOf, oneOf, not).
-    allow_nested_x_validations: bool,
-
-    /// AllowValidationPropertiesWithAdditionalProperties allows
-    /// value validations on specific properties that are structually
-    /// defined by additionalProperties. i.e. additionalProperties in main structural
-    /// schema, but properties within an allOf.
-    allow_validation_properties_with_additional_properties: bool,
-}
-
-/// ValidateStructural checks that s is a structural schema with the invariants:
+/// validateStructuralCompleteness checks that all value validations in s have
+/// a structural counterpart so that every value validation applies to a value
+/// with a known schema:
+/// - validations for specific properties must have that property (or additionalProperties under an option) structurally defined
+/// - additionalProperties validations must have additionalProperties defined in the structural portion of the schema corresponding to that node
+/// - Items validations must have also have a corresponding items structurally
 ///
-/// * structurality: both `ForbiddenGenerics` and `ForbiddenExtensions` only have zero values, with the two exceptions for IntOrString.
-/// * RawExtension: for every schema with `x-kubernetes-embedded-resource: true`, `x-kubernetes-preserve-unknown-fields: true` and `type: object` are set
-/// * IntOrString: for `x-kubernetes-int-or-string: true` either `type` is empty under `anyOf` and `allOf` or the schema structure is one of these:
-///
-///  1. anyOf:
-///     - type: integer
-///     - type: string
-///  2. allOf:
-///     - anyOf:
-///     - type: integer
-///     - type: string
-///     - ... zero or more
-///
-/// * every specified field or array in s is also specified outside of value validation.
-/// * metadata at the root can only restrict the name and generateName, and not be specified at all in nested contexts.
-/// * additionalProperties at the root is not allowed.
-fn validate_structural(fld_path: &FieldPath, s: &Structural) -> FieldErrorList {
-    validate_structural_with_options(
-        fld_path,
-        s,
-        ValidationOptions {
-            // This would widen the schema for CRD if set to true, so first few releases will still
-            // not admit any. But it can still be used by libraries and
-            // declarative validation for native types
-            allow_nested_additional_properties: false,
-            allow_nested_x_validations: false,
-            allow_validation_properties_with_additional_properties: false,
-        },
-    )
-}
-
-fn validate_structural_with_options(
-    fld_path: &FieldPath,
-    s: &Structural,
-    opts: ValidationOptions,
-) -> FieldErrorList {
-    let mut all_errs = FieldErrorList::new();
-
-    all_errs.extend(validate_structural_invariants(s, Level::Root, fld_path, &opts));
-    all_errs.extend(validate_structural_completeness(s, fld_path, &opts));
-
-    // sort error messages. Otherwise, the errors slice will change every time due to
-    // maps in the types and randomized iteration.
-    all_errs.sort_by(|a, b| a.error().cmp(&b.error()));
-
-    all_errs
-}
-
-/// validateStructuralInvariants checks the invariants of a structural schema.
-fn validate_structural_invariants(
-    s: &Structural,
-    lvl: Level,
+/// The "structural" portion of the schema refers to all nodes in the
+/// schema traversible without following any NestedValueValidations.
+fn validate_structural_completeness(
+    s: &Option<Structural>,
     fld_path: &FieldPath,
     opts: &ValidationOptions,
 ) -> FieldErrorList {
@@ -104,479 +16,160 @@ fn validate_structural_invariants(
         return FieldErrorList::new();
     }
 
+    let s = s.as_ref().unwrap();
+    validate_value_validation_completeness(
+        &s.value_validation,
+        &Some(s.clone()),
+        fld_path,
+        fld_path,
+        opts,
+    )
+}
+
+fn validate_value_validation_completeness(
+    v: &Option<ValueValidation>,
+    s: &Option<Structural>,
+    s_path: &FieldPath,
+    v_path: &FieldPath,
+    opts: &ValidationOptions,
+) -> FieldErrorList {
+    if v.is_none() {
+        return FieldErrorList::new();
+    }
+    if s.is_none() {
+        return vec![FieldError::required(
+            s_path,
+            &format!("because it is defined in {}", v_path.to_string()),
+        )];
+    }
+
+    let v = v.as_ref().unwrap();
+    let s = s.as_ref().unwrap();
     let mut all_errs = FieldErrorList::new();
 
-    if s.type_ == "array" && s.items.is_none() {
-        all_errs.push(FieldError::required(
-            fld_path.child("items"),
-            "must be specified",
-        ));
-    }
-    all_errs.extend(validate_structural_invariants(
-        &s.items,
-        Level::Item,
-        &fld_path.child("items"),
+    all_errs.extend(validate_nested_value_validation_completeness(
+        &v.not,
+        &Some(s.clone()),
+        s_path,
+        &v_path.child("not"),
         opts,
     ));
-
-    for (k, v) in &s.properties {
-        all_errs.extend(validate_structural_invariants(
-            v,
-            Level::Field,
-            &fld_path.child("properties").key(k),
+    for (i, all_of_item) in v.all_of.iter().enumerate() {
+        all_errs.extend(validate_nested_value_validation_completeness(
+            &Some(all_of_item.clone()),
+            &Some(s.clone()),
+            s_path,
+            &v_path.child("allOf").index(i),
+            opts,
+        ));
+    }
+    for (i, any_of_item) in v.any_of.iter().enumerate() {
+        all_errs.extend(validate_nested_value_validation_completeness(
+            &Some(any_of_item.clone()),
+            &Some(s.clone()),
+            s_path,
+            &v_path.child("anyOf").index(i),
+            opts,
+        ));
+    }
+    for (i, one_of_item) in v.one_of.iter().enumerate() {
+        all_errs.extend(validate_nested_value_validation_completeness(
+            &Some(one_of_item.clone()),
+            &Some(s.clone()),
+            s_path,
+            &v_path.child("oneOf").index(i),
             opts,
         ));
     }
 
-    if let Some(additional_properties) = &s.additional_properties {
-        if lvl == Level::Root {
-            all_errs.push(FieldError::forbidden(
-                fld_path.child("additionalProperties"),
-                "must not be used at the root",
-            ));
-        }
-        if let Some(structural) = &additional_properties.structural {
-            all_errs.extend(validate_structural_invariants(
-                structural,
-                Level::Field,
-                &fld_path.child("additionalProperties"),
+    all_errs
+}
+
+fn validate_nested_value_validation_completeness(
+    v: &Option<NestedValueValidation>,
+    s: &Option<Structural>,
+    s_path: &FieldPath,
+    v_path: &FieldPath,
+    opts: &ValidationOptions,
+) -> FieldErrorList {
+    if v.is_none() {
+        return FieldErrorList::new();
+    }
+    if s.is_none() {
+        return vec![FieldError::required(
+            s_path,
+            &format!("because it is defined in {}", v_path.to_string()),
+        )];
+    }
+
+    let v = v.as_ref().unwrap();
+    let s = s.as_ref().unwrap();
+    let mut all_errs = FieldErrorList::new();
+
+    all_errs.extend(validate_value_validation_completeness(
+        &Some(v.value_validation.clone()),
+        &Some(s.clone()),
+        s_path,
+        v_path,
+        opts,
+    ));
+    all_errs.extend(validate_nested_value_validation_completeness(
+        &v.items,
+        &s.items,
+        &s_path.child("items"),
+        &v_path.child("items"),
+        opts,
+    ));
+
+    let s_additional_properties_schema = s
+        .additional_properties
+        .as_ref()
+        .and_then(|ap| ap.structural.clone());
+
+    for (k, v_fld) in &v.properties {
+        if let Some(s_fld) = s.properties.get(k) {
+            all_errs.extend(validate_nested_value_validation_completeness(
+                &Some(v_fld.clone()),
+                &Some(s_fld.clone()),
+                &s_path.child("properties").key(k),
+                &v_path.child("properties").key(k),
                 opts,
             ));
-        }
-    }
-
-    all_errs.extend(validate_generic(&s.generic, lvl, fld_path));
-    all_errs.extend(validate_extensions(&s.extensions, fld_path));
-
-    // detect the two IntOrString exceptions:
-    // 1) anyOf:
-    //    - type: integer
-    //    - type: string
-    // 2) allOf:
-    //    - anyOf:
-    //      - type: integer
-    //      - type: string
-    //    - ... zero or more
-    let skip_any_of = is_int_or_string_any_of_pattern(s);
-    let skip_first_all_of_any_of = is_int_or_string_all_of_pattern(s);
-
-    all_errs.extend(validate_value_validation(
-        &s.value_validation,
-        skip_any_of,
-        skip_first_all_of_any_of,
-        lvl,
-        fld_path,
-        opts,
-    ));
-
-    let check_metadata = (lvl == Level::Root) || s.x_embedded_resource;
-
-    if s.x_embedded_resource && s.type_ != "object" {
-        if s.type_.is_empty() {
-            all_errs.push(FieldError::required(
-                fld_path.child("type"),
-                "must be object if x-kubernetes-embedded-resource is true",
-            ));
         } else {
-            all_errs.push(FieldError::invalid(
-                fld_path.child("type"),
-                &s.type_,
-                "must be object if x-kubernetes-embedded-resource is true",
-            ));
-        }
-    } else if s.type_.is_empty()
-        && !s.extensions.x_int_or_string
-        && !s.extensions.x_preserve_unknown_fields
-    {
-        match lvl {
-            Level::Root => {
+            if s_additional_properties_schema.is_none()
+                || !opts.allow_validation_properties_with_additional_properties
+            {
                 all_errs.push(FieldError::required(
-                    fld_path.child("type"),
-                    "must not be empty at the root",
+                    &s_path.child("properties").key(k),
+                    &format!(
+                        "because it is defined in {}",
+                        v_path.child("properties").key(k).to_string()
+                    ),
                 ));
-            }
-            Level::Item => {
-                all_errs.push(FieldError::required(
-                    fld_path.child("type"),
-                    "must not be empty for specified array items",
-                ));
-            }
-            Level::Field => {
-                all_errs.push(FieldError::required(
-                    fld_path.child("type"),
-                    "must not be empty for specified object fields",
+            } else {
+                // Allow validations on specific properties if there exists an
+                // additionalProperties structural schema specified instead of
+                // direct properties
+                // NOTE: This does not allow `additionalProperties: true` structural
+                // schema to be combined with specific property validations.
+                all_errs.extend(validate_nested_value_validation_completeness(
+                    &Some(v_fld.clone()),
+                    &s_additional_properties_schema,
+                    &s_path.child("additionalProperties"),
+                    &v_path.child("properties").key(k),
+                    opts,
                 ));
             }
         }
     }
-    if s.x_embedded_resource && s.additional_properties.is_some() {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("additionalProperties"),
-            "must not be used if x-kubernetes-embedded-resource is set",
-        ));
-    }
 
-    if lvl == Level::Root && !s.type_.is_empty() && s.type_ != "object" {
-        all_errs.push(FieldError::invalid(
-            fld_path.child("type"),
-            &s.type_,
-            "must be object at the root",
-        ));
-    }
-
-    // restrict metadata schemas to name and generateName only
-    if let Some(kind) = s.properties.get("kind") {
-        if check_metadata && kind.type_ != "string" {
-            all_errs.push(FieldError::invalid(
-                fld_path.child("properties").key("kind").child("type"),
-                &kind.type_,
-                "must be string",
-            ));
-        }
-    }
-    if let Some(api_version) = s.properties.get("apiVersion") {
-        if check_metadata && api_version.type_ != "string" {
-            all_errs.push(FieldError::invalid(
-                fld_path.child("properties").key("apiVersion").child("type"),
-                &api_version.type_,
-                "must be string",
-            ));
-        }
-    }
-
-    if let Some(metadata) = s.properties.get("metadata") {
-        all_errs.extend(validate_structural_metadata_invariants(
-            metadata,
-            check_metadata,
-            lvl,
-            &fld_path.child("properties").key("metadata"),
-        ));
-    }
-
-    if s.x_embedded_resource && !s.x_preserve_unknown_fields && s.properties.is_empty() {
-        all_errs.push(FieldError::required(
-            fld_path.child("properties"),
-            "must not be empty if x-kubernetes-embedded-resource is true without x-kubernetes-preserve-unknown-fields",
-        ));
-    }
-
-    all_errs
-}
-
-fn validate_structural_metadata_invariants(
-    s: &Structural,
-    check_metadata: bool,
-    lvl: Level,
-    fld_path: &FieldPath,
-) -> FieldErrorList {
-    let mut all_errs = FieldErrorList::new();
-
-    if check_metadata && s.type_ != "object" {
-        all_errs.push(FieldError::invalid(
-            fld_path.child("type"),
-            &s.type_,
-            "must be object",
-        ));
-    }
-
-    if lvl == Level::Root {
-        // metadata is a shallow copy. We can mutate it.
-        let mut s_copy = s.clone();
-        let found_name = s_copy.properties.contains_key("name");
-        let found_generate_name = s_copy.properties.contains_key("generateName");
-        if found_name && found_generate_name && s_copy.properties.len() == 2 {
-            s_copy.properties.clear();
-        } else if (found_name || found_generate_name) && s_copy.properties.len() == 1 {
-            s_copy.properties.clear();
-        }
-        s_copy.type_ = String::new();
-        s_copy.default.object = None; // this is checked in API validation (and also tested)
-        if s_copy.value_validation.is_none() {
-            s_copy.value_validation = Some(ValueValidation::default());
-        }
-        let empty_structural = Structural {
-            value_validation: Some(ValueValidation::default()),
-            ..Default::default()
-        };
-        if s_copy != empty_structural {
-            // TODO: this is actually a field.Invalid error, but we cannot do JSON serialization of metadata here to get a proper message
-            all_errs.push(FieldError::forbidden(
-                fld_path,
-                "must not specify anything other than name and generateName, but metadata is implicitly specified",
-            ));
-        }
-    }
-
-    all_errs
-}
-
-fn is_int_or_string_any_of_pattern(s: &Structural) -> bool {
-    if let Some(value_validation) = &s.value_validation {
-        return value_validation.any_of.len() == 2
-            && value_validation.any_of == *INT_OR_STRING_ANY_OF;
-    }
-    false
-}
-
-fn is_int_or_string_all_of_pattern(s: &Structural) -> bool {
-    if let Some(value_validation) = &s.value_validation {
-        return !value_validation.all_of.is_empty()
-            && value_validation.all_of[0].any_of.len() == 2
-            && value_validation.all_of[0].any_of == *INT_OR_STRING_ANY_OF;
-    }
-    false
-}
-
-/// validateGeneric checks the generic fields of a structural schema.
-fn validate_generic(g: &Generic, lvl: Level, fld_path: &FieldPath) -> FieldErrorList {
-    if g.is_none() {
-        return FieldErrorList::new();
-    }
-
-    FieldErrorList::new()
-}
-
-/// validateExtensions checks Kubernetes vendor extensions of a structural schema.
-fn validate_extensions(x: &Extensions, fld_path: &FieldPath) -> FieldErrorList {
-    let mut all_errs = FieldErrorList::new();
-
-    if x.x_int_or_string && x.x_preserve_unknown_fields {
-        all_errs.push(FieldError::invalid(
-            fld_path.child("x-kubernetes-preserve-unknown-fields"),
-            &x.x_preserve_unknown_fields,
-            "must be false if x-kubernetes-int-or-string is true",
-        ));
-    }
-    if x.x_int_or_string && x.x_embedded_resource {
-        all_errs.push(FieldError::invalid(
-            fld_path.child("x-kubernetes-embedded-resource"),
-            &x.x_embedded_resource,
-            "must be false if x-kubernetes-int-or-string is true",
-        ));
-    }
-
-    all_errs
-}
-
-/// validateValueValidation checks the value validation in a structural schema.
-fn validate_value_validation(
-    v: &Option<ValueValidation>,
-    skip_any_of: bool,
-    skip_first_all_of_any_of: bool,
-    lvl: Level,
-    fld_path: &FieldPath,
-    opts: &ValidationOptions,
-) -> FieldErrorList {
-    if v.is_none() {
-        return FieldErrorList::new();
-    }
-
-    let v = v.as_ref().unwrap();
-    let mut all_errs = FieldErrorList::new();
-
-    // We still unconditionally forbid XValidations in quantifiers, the only
-    // quantifier that is allowed to have right now is AllOf. This is due to
-    // implementation constraints - the SchemaValidator would need to become
-    // aware of CEL to properly implement the other quantifiers.
-    let mut opts_with_cel_disabled = opts.clone();
-    opts_with_cel_disabled.allow_nested_x_validations = false;
-
-    if !skip_any_of {
-        for (i, any_of_item) in v.any_of.iter().enumerate() {
-            all_errs.extend(validate_nested_value_validation(
-                &Some(any_of_item.clone()),
-                false,
-                false,
-                lvl,
-                &fld_path.child("anyOf").index(i),
-                &opts_with_cel_disabled,
-            ));
-        }
-    }
-
-    for (i, all_of_item) in v.all_of.iter().enumerate() {
-        let skip_any_of = skip_first_all_of_any_of && i == 0;
-        all_errs.extend(validate_nested_value_validation(
-            &Some(all_of_item.clone()),
-            skip_any_of,
-            false,
-            lvl,
-            &fld_path.child("allOf").index(i),
-            opts,
-        ));
-    }
-
-    for (i, one_of_item) in v.one_of.iter().enumerate() {
-        all_errs.extend(validate_nested_value_validation(
-            &Some(one_of_item.clone()),
-            false,
-            false,
-            lvl,
-            &fld_path.child("oneOf").index(i),
-            &opts_with_cel_disabled,
-        ));
-    }
-
-    all_errs.extend(validate_nested_value_validation(
-        &v.not,
-        false,
-        false,
-        lvl,
-        &fld_path.child("not"),
-        &opts_with_cel_disabled,
-    ));
-
-    if !v.pattern.is_empty() {
-        if let Err(err) = regex::Regex::new(&v.pattern) {
-            all_errs.push(FieldError::invalid(
-                fld_path.child("pattern"),
-                &v.pattern,
-                &format!("must be a valid regular expression, but isn't: {}", err),
-            ));
-        }
-    }
-
-    all_errs
-}
-
-/// validateNestedValueValidation checks the nested value validation under a logic junctor in a structural schema.
-fn validate_nested_value_validation(
-    v: &Option<NestedValueValidation>,
-    skip_any_of: bool,
-    skip_all_of_any_of: bool,
-    lvl: Level,
-    fld_path: &FieldPath,
-    opts: &ValidationOptions,
-) -> FieldErrorList {
-    if v.is_none() {
-        return FieldErrorList::new();
-    }
-
-    let v = v.as_ref().unwrap();
-    let mut all_errs = FieldErrorList::new();
-
-    all_errs.extend(validate_value_validation(
-        &Some(v.value_validation.clone()),
-        skip_any_of,
-        skip_all_of_any_of,
-        lvl,
-        fld_path,
-        opts,
-    ));
-    all_errs.extend(validate_nested_value_validation(
-        &v.items,
-        false,
-        false,
-        lvl,
-        &fld_path.child("items"),
-        opts,
-    ));
-
-    for (k, fld) in &v.properties {
-        all_errs.extend(validate_nested_value_validation(
-            &Some(fld.clone()),
-            false,
-            false,
-            Level::Field,
-            &fld_path.child("properties").key(k),
-            opts,
-        ));
-    }
-
-    if !v.forbidden_generics.type_.is_empty() {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("type"),
-            "must be empty to be structural",
-        ));
-    }
-    if v.additional_properties.is_some() && !opts.allow_nested_additional_properties {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("additionalProperties"),
-            "must be undefined to be structural",
-        ));
-    } else {
-        all_errs.extend(validate_nested_value_validation(
+    if v.additional_properties.is_some() && opts.allow_nested_additional_properties {
+        all_errs.extend(validate_nested_value_validation_completeness(
             &v.additional_properties,
-            false,
-            false,
-            lvl,
-            &fld_path.child("additionalProperties"),
+            &s_additional_properties_schema,
+            &s_path.child("additionalProperties"),
+            &v_path.child("additionalProperties"),
             opts,
-        ));
-    }
-    if v.forbidden_generics.default.object.is_some() {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("default"),
-            "must be undefined to be structural",
-        ));
-    }
-    if !v.forbidden_generics.title.is_empty() {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("title"),
-            "must be empty to be structural",
-        ));
-    }
-    if !v.forbidden_generics.description.is_empty() {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("description"),
-            "must be empty to be structural",
-        ));
-    }
-    if v.forbidden_generics.nullable {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("nullable"),
-            "must be false to be structural",
-        ));
-    }
-
-    if v.forbidden_extensions.x_preserve_unknown_fields {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("x-kubernetes-preserve-unknown-fields"),
-            "must be false to be structural",
-        ));
-    }
-    if v.forbidden_extensions.x_embedded_resource {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("x-kubernetes-embedded-resource"),
-            "must be false to be structural",
-        ));
-    }
-    if v.forbidden_extensions.x_int_or_string {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("x-kubernetes-int-or-string"),
-            "must be false to be structural",
-        ));
-    }
-    if !v.forbidden_extensions.x_list_map_keys.is_empty() {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("x-kubernetes-list-map-keys"),
-            "must be empty to be structural",
-        ));
-    }
-    if v.forbidden_extensions.x_list_type.is_some() {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("x-kubernetes-list-type"),
-            "must be undefined to be structural",
-        ));
-    }
-    if v.forbidden_extensions.x_map_type.is_some() {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("x-kubernetes-map-type"),
-            "must be undefined to be structural",
-        ));
-    }
-    if !v.validation_extensions.x_validations.is_empty() && !opts.allow_nested_x_validations {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("x-kubernetes-validations"),
-            "must be empty to be structural",
-        ));
-    }
-
-    // forbid reasoning about metadata because it can lead to metadata restriction we don't want
-    if v.properties.contains_key("metadata") {
-        all_errs.push(FieldError::forbidden(
-            fld_path.child("properties").key("metadata"),
-            "must not be specified in a nested context",
         ));
     }
 
